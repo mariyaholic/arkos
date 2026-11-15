@@ -1,0 +1,9 @@
+/target/
+*.exe
+*.pdb
+
+# Runtime state and local output
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+probe.txt
