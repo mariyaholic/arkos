@@ -146,12 +146,19 @@ fn unlock_exclusive(file: &File) -> std::io::Result<()> {
     }
 }
 
+// On Unix, std's `File::try_lock` takes `flock(LOCK_EX | LOCK_NB)` on the whole file. The lock
+// belongs to the open file description, so a second `open` of the same lock file conflicts even
+// inside one process, and the kernel releases it when the descriptor closes.
 #[cfg(not(windows))]
-fn try_lock_exclusive(_file: &File) -> std::io::Result<bool> {
-    Ok(true)
+fn try_lock_exclusive(file: &File) -> std::io::Result<bool> {
+    match file.try_lock() {
+        Ok(()) => Ok(true),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(false),
+        Err(std::fs::TryLockError::Error(err)) => Err(err),
+    }
 }
 
 #[cfg(not(windows))]
-fn unlock_exclusive(_file: &File) -> std::io::Result<()> {
-    Ok(())
+fn unlock_exclusive(file: &File) -> std::io::Result<()> {
+    file.unlock()
 }
