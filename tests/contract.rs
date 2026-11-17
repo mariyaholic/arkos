@@ -126,7 +126,9 @@ fn lock_wait_times_out_as_6_and_a_dead_running_row_is_abandoned_by_the_next_scan
     let mut conn = db::open_and_migrate(&paths.db, &paths.locks, 500).unwrap();
     let tree = root.join("vol");
     std::fs::create_dir_all(&tree).unwrap();
-    let vol_key = format!("dir:{}", tree.to_string_lossy());
+    // Use the scan's own key: on Windows, canonicalising expands 8.3 short names (RUNNER~1) in the
+    // temp path, so a hand-built `dir:` key would not match the volume the scan looks up.
+    let vol_key = arkos::volumes::volume_key(&tree.to_string_lossy()).unwrap();
     conn.execute(
         "INSERT INTO arkos_snapshots(volume, root, mode, elevated, state, started_at)
          VALUES(?1, ?2, 'walk', 0, 'running', ?3)",

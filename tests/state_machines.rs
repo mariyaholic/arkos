@@ -24,6 +24,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use support::{temp_dir, Env};
 
+/// The volume key a scan of `dir` uses. Tests must not build `dir:` keys by hand: on Windows,
+/// canonicalising expands 8.3 short names in the temp path, so a hand-built key names a different
+/// volume and a different lock file.
+fn dir_key(dir: &std::path::Path) -> String {
+    arkos::volumes::volume_key(&dir.to_string_lossy()).unwrap()
+}
+
 fn now() -> i64 {
     chrono::Utc::now().timestamp()
 }
@@ -215,15 +222,8 @@ fn an_unreadable_lock_file_falls_back_to_the_24_hour_rule() {
 fn a_second_scan_of_a_running_volume_is_refused_and_leaves_the_first_row_alone() {
     let mut env = Env::new("sm-second");
     let tree = small_tree(&env);
-    let id = insert_snap(
-        &env.conn,
-        &format!("dir:{}", tree.display()),
-        "r",
-        "running",
-        now(),
-    );
-    let held =
-        VolumeLock::acquire(&env.paths.locks, &format!("dir:{}", tree.display()), 200).unwrap();
+    let id = insert_snap(&env.conn, &dir_key(&tree), "r", "running", now());
+    let held = VolumeLock::acquire(&env.paths.locks, &dir_key(&tree), 200).unwrap();
     let cfg = Config {
         busy_timeout_ms: 50,
         ..Config::default()
@@ -258,7 +258,7 @@ fn sm1_scan_abandons_a_dead_running_row_it_finds_under_its_own_lock() {
     // this one waits for the lock. Nobody holds the lock now, so the row's owner is gone.
     let dead = insert_snap(
         &env.conn,
-        &format!("dir:{}", tree.display()),
+        &dir_key(&tree),
         &tree.to_string_lossy(),
         "running",
         now(),
@@ -275,7 +275,7 @@ fn sm1_scan_abandons_a_dead_running_row_it_finds_under_its_own_lock() {
 fn sm2_scan_does_not_report_success_for_a_snapshot_that_vanished() {
     let mut env = Env::new("sm2");
     let tree = small_tree(&env);
-    let vol = format!("dir:{}", tree.display());
+    let vol = dir_key(&tree);
     let root = tree.to_string_lossy().into_owned();
     let db_path = env.paths.db.clone();
     let elsewhere = env.root.join("elsewhere");
@@ -582,13 +582,7 @@ fn volume_key_accepts_scan_spelling_stored_key_and_missing_dirs() {
 fn a_scan_that_abandons_a_dead_row_stamps_finished_at() {
     let mut env = Env::new("sm1-finished");
     let tree = small_tree(&env);
-    let dead = insert_snap(
-        &env.conn,
-        &format!("dir:{}", tree.display()),
-        "r",
-        "running",
-        now(),
-    );
+    let dead = insert_snap(&env.conn, &dir_key(&tree), "r", "running", now());
     scan_walk(&mut env, &tree.to_string_lossy(), None).unwrap();
     let finished: Option<i64> = env
         .conn
