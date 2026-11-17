@@ -75,6 +75,36 @@ impl VolumeLock {
     }
 }
 
+impl VolumeLock {
+    /// True when nobody holds the lock for `volume`. Tries the lock without waiting and releases
+    /// it at once; it creates nothing and never writes to the lock file.
+    pub fn is_free(locks_dir: &Path, volume: &str) -> Result<bool> {
+        let path = lock_path_for(locks_dir, volume);
+        let file = match OpenOptions::new().read(true).write(true).open(&path) {
+            Ok(f) => f,
+            // No lock file means no scan ever took this lock.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+            Err(source) => {
+                return Err(Error::Io {
+                    context: "open volume lock file",
+                    source,
+                })
+            }
+        };
+        match try_lock_exclusive(&file) {
+            Ok(true) => {
+                let _ = unlock_exclusive(&file);
+                Ok(true)
+            }
+            Ok(false) => Ok(false),
+            Err(source) => Err(Error::Io {
+                context: "lock volume file",
+                source,
+            }),
+        }
+    }
+}
+
 impl Drop for VolumeLock {
     fn drop(&mut self) {
         let _ = unlock_exclusive(&self.file);

@@ -52,6 +52,11 @@ ReFS. The snapshot records the path that actually ran. The MFT reader covers a w
 scan of a subfolder always walks. If a volume has more than a million folders, or cannot be
 opened, the scan walks and the log notes why.
 
+`--mode mft` counts each hardlinked file once, because USN enumeration returns one name per
+file, while the walk counts every name. Totals from the two modes can therefore differ on volumes
+with many hardlinks, such as WinSxS. `--mode mft` also sizes each file with one open call, so its
+speed is unmeasured until someone runs it on an elevated Windows prompt.
+
 ## What `denied` means
 
 `denied` counts folders or files that Arkos could not read, usually for lack of permission. They

@@ -1,7 +1,7 @@
 //! Snapshot retention, abandoned-scan sweeper, and bounded incremental vacuum.
 
 use crate::db::map_db_err;
-use crate::exit::{Error, Result};
+use crate::exit::Result;
 use crate::lock::VolumeLock;
 use rusqlite::{params, Connection};
 use serde::Serialize;
@@ -63,12 +63,8 @@ pub fn sweep_abandoned_with_locks(conn: &Connection, locks_dir: &Path, now: i64)
 
     let mut changed = 0usize;
     for (id, volume, started_at) in running {
-        let dead = match VolumeLock::acquire(locks_dir, &volume, 0) {
-            Ok(lock) => {
-                drop(lock);
-                true
-            }
-            Err(Error::Busy(_)) => false,
+        let dead = match VolumeLock::is_free(locks_dir, &volume) {
+            Ok(free) => free,
             Err(_) => started_at < now - STALE_RUNNING_AGE_SECS,
         };
         if dead {

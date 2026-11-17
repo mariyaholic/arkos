@@ -91,8 +91,10 @@ pub fn parse_usn_buffer(
             let name_off = u16_at(buf, off + 58) as usize;
             if name_off + name_len <= len && name_len & 1 == 0 {
                 let units: Vec<u16> = buf[off + name_off..off + name_off + name_len]
-                    .chunks_exact(2)
-                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c: &[u8; 2]| u16::from_le_bytes(*c))
                     .collect();
                 let (name, valid_unicode) = match String::from_utf16(&units) {
                     Ok(s) => (s, true),
@@ -171,6 +173,7 @@ fn is_excluded(filter: &ScanFilter<'_>, name: &str, path: &str) -> bool {
 
 fn note_non_unicode(stats: &mut WalkStats, parent_path: &str, name: &str) {
     stats.skipped += 1;
+    stats.non_unicode_total += 1;
     if stats.non_unicode.len() < MAX_LOGGED_NAMES {
         stats.non_unicode.push(join_win(parent_path, name));
     }

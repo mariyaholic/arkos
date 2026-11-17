@@ -28,7 +28,7 @@ fn migration_0001_idempotent_and_foreign_keys_cascade_on_prune() {
     let root = temp_dir("migrate");
     let paths = Paths::from_home(root.join("home"));
     paths.ensure_dirs().unwrap();
-    let mut conn = db::open_and_migrate(&paths.db, 1000).unwrap();
+    let mut conn = db::open_and_migrate(&paths.db, &paths.locks, 1000).unwrap();
     let v = db::migrate(&conn).unwrap();
     assert_eq!(v, 1);
 
@@ -77,7 +77,7 @@ fn newer_user_version_is_4_and_no_write() {
         conn.execute("CREATE TABLE future_tbl(x INTEGER)", [])
             .unwrap();
     }
-    let err = db::open_and_migrate(&db_path, 500).unwrap_err();
+    let err = db::open_and_migrate(&db_path, &root.join("locks"), 500).unwrap_err();
     assert_eq!(err.exit(), Exit::Refused);
 
     let check = Connection::open(&db_path).unwrap();
@@ -93,7 +93,7 @@ fn duplicut_0002_does_not_touch_arkos_tables() {
     let root = temp_dir("0002");
     let paths = Paths::from_home(root.join("home"));
     paths.ensure_dirs().unwrap();
-    let conn = db::open_and_migrate(&paths.db, 500).unwrap();
+    let conn = db::open_and_migrate(&paths.db, &paths.locks, 500).unwrap();
     conn.execute_batch(
         "CREATE TABLE duplicut_groups(id INTEGER PRIMARY KEY, size INTEGER);
          PRAGMA user_version = 2;",
@@ -123,7 +123,7 @@ fn lock_wait_times_out_as_6_and_second_scan_is_4() {
     let _other = VolumeLock::acquire(&paths.locks, "D:", 80).unwrap();
     drop(held);
 
-    let mut conn = db::open_and_migrate(&paths.db, 500).unwrap();
+    let mut conn = db::open_and_migrate(&paths.db, &paths.locks, 500).unwrap();
     let tree = root.join("vol");
     std::fs::create_dir_all(&tree).unwrap();
     let vol_key = format!("dir:{}", tree.to_string_lossy());
@@ -161,7 +161,7 @@ fn dir_bytes_equal_sum_of_children_and_depth_pass_is_single_scan() {
     let root = temp_dir("rollup");
     let paths = Paths::from_home(root.join("home"));
     paths.ensure_dirs().unwrap();
-    let mut conn = db::open_and_migrate(&paths.db, 1000).unwrap();
+    let mut conn = db::open_and_migrate(&paths.db, &paths.locks, 1000).unwrap();
 
     let tree = root.join("tree");
     std::fs::create_dir_all(tree.join("a/b/c")).unwrap();
@@ -217,7 +217,7 @@ fn diff_detects_grow_shrink_new_deleted_and_refuses_failed() {
     let root = temp_dir("diff");
     let paths = Paths::from_home(root.join("home"));
     paths.ensure_dirs().unwrap();
-    let mut conn = db::open_and_migrate(&paths.db, 1000).unwrap();
+    let mut conn = db::open_and_migrate(&paths.db, &paths.locks, 1000).unwrap();
 
     let tree = root.join("tree");
     std::fs::create_dir_all(tree.join("grow")).unwrap();
@@ -288,7 +288,7 @@ fn diff_detects_grow_shrink_new_deleted_and_refuses_failed() {
     let bad_id = conn.last_insert_rowid();
     drop(conn);
 
-    let conn2 = db::open_and_migrate(&paths.db, 1000).unwrap();
+    let conn2 = db::open_and_migrate(&paths.db, &paths.locks, 1000).unwrap();
     let state: String = conn2
         .query_row(
             "SELECT state FROM arkos_snapshots WHERE id = ?1",
@@ -308,7 +308,7 @@ fn retention_keeps_n_and_html_escapes_script_names() {
     let root = temp_dir("ret_html");
     let paths = Paths::from_home(root.join("home"));
     paths.ensure_dirs().unwrap();
-    let mut conn = db::open_and_migrate(&paths.db, 1000).unwrap();
+    let mut conn = db::open_and_migrate(&paths.db, &paths.locks, 1000).unwrap();
 
     for i in 1..=5i64 {
         conn.execute(

@@ -203,7 +203,7 @@ fn try_run() -> Result<Exit> {
             excludes,
             json,
         } => {
-            let mut conn = db::open_and_migrate(&paths.db, config.busy_timeout_ms)?;
+            let mut conn = db::open_and_migrate(&paths.db, &paths.locks, config.busy_timeout_ms)?;
             let mut progress = Reporter::auto(json);
             let report = run_scan_with_progress(
                 &mut conn,
@@ -246,7 +246,7 @@ fn try_run() -> Result<Exit> {
             limit,
             json,
         } => {
-            let conn = db::open_and_migrate(&paths.db, config.busy_timeout_ms)?;
+            let conn = db::open_and_migrate(&paths.db, &paths.locks, config.busy_timeout_ms)?;
             let rows = list_snapshots(&conn, volume.as_deref(), limit)?;
             if json {
                 println!(
@@ -286,7 +286,7 @@ fn try_run() -> Result<Exit> {
                     )));
                 }
             }
-            let conn = db::open_and_migrate(&paths.db, config.busy_timeout_ms)?;
+            let conn = db::open_and_migrate(&paths.db, &paths.locks, config.busy_timeout_ms)?;
             let report = diff_snapshots(&conn, a, b, min_size, top)?;
             let text =
                 serde_json::to_string_pretty(&report).map_err(|e| Error::Cli(e.to_string()))?;
@@ -328,7 +328,7 @@ fn try_run() -> Result<Exit> {
             limit,
             json,
         } => {
-            let conn = db::open_and_migrate(&paths.db, config.busy_timeout_ms)?;
+            let conn = db::open_and_migrate(&paths.db, &paths.locks, config.busy_timeout_ms)?;
             let items = query_top(&conn, snapshot, dirs, by, limit)?;
             if json {
                 println!(
@@ -347,7 +347,7 @@ fn try_run() -> Result<Exit> {
             out,
             depth,
         } => {
-            let conn = db::open_and_migrate(&paths.db, config.busy_timeout_ms)?;
+            let conn = db::open_and_migrate(&paths.db, &paths.locks, config.busy_timeout_ms)?;
             write_tree_file(&conn, snapshot, &out, depth)?;
             println!("wrote treemap {}", out.display());
             Ok(Exit::Ok)
@@ -363,7 +363,7 @@ fn try_run() -> Result<Exit> {
             if !(1..=12).contains(&keep) {
                 return Err(Error::Cli("--keep must be between 1 and 12".into()));
             }
-            let conn = db::open_and_migrate(&paths.db, config.busy_timeout_ms)?;
+            let conn = db::open_and_migrate(&paths.db, &paths.locks, config.busy_timeout_ms)?;
             if yes {
                 let deleted = db::retention::prune_completed(&conn, volume.as_deref(), keep)?;
                 if json {
@@ -406,7 +406,7 @@ fn try_run() -> Result<Exit> {
             }
         }
         Command::Status { probe, json } => {
-            let conn = db::open_and_migrate(&paths.db, config.busy_timeout_ms)?;
+            let conn = db::open_and_migrate(&paths.db, &paths.locks, config.busy_timeout_ms)?;
             let code = status_probe_exit(&conn)?;
             let info = db::info(&conn)?;
             if probe && !json {
@@ -438,7 +438,7 @@ fn try_run() -> Result<Exit> {
         }
         Command::Db { action } => match action {
             DbAction::Info { json } => {
-                let conn = db::open_and_migrate(&paths.db, config.busy_timeout_ms)?;
+                let conn = db::open_and_migrate(&paths.db, &paths.locks, config.busy_timeout_ms)?;
                 let info = db::info(&conn)?;
                 if json {
                     println!(
@@ -459,13 +459,13 @@ fn try_run() -> Result<Exit> {
                 Ok(Exit::Ok)
             }
             DbAction::Migrate => {
-                let conn = db::open_and_migrate(&paths.db, config.busy_timeout_ms)?;
+                let conn = db::open_and_migrate(&paths.db, &paths.locks, config.busy_timeout_ms)?;
                 let ver: u32 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
                 println!("migrated shimatsu.sqlite user_version={ver}");
                 Ok(Exit::Ok)
             }
             DbAction::Vacuum => {
-                let conn = db::open_and_migrate(&paths.db, config.busy_timeout_ms)?;
+                let conn = db::open_and_migrate(&paths.db, &paths.locks, config.busy_timeout_ms)?;
                 let reclaimed = db::vacuum(&conn)?;
                 println!("vacuum reclaimed {reclaimed} bytes");
                 Ok(Exit::Ok)

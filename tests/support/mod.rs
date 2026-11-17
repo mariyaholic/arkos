@@ -36,7 +36,7 @@ impl Env {
         let root = temp_dir(name);
         let paths = Paths::from_home(root.join("home"));
         paths.ensure_dirs().unwrap();
-        let conn = db::open_and_migrate(&paths.db, 1000).unwrap();
+        let conn = db::open_and_migrate(&paths.db, &paths.locks, 1000).unwrap();
         Self { root, paths, conn }
     }
 

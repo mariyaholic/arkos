@@ -217,22 +217,27 @@ pub fn run_scan_with_progress(
     if let Some(note) = &note {
         logger.event("scan_note", &format!("snapshot={snapshot_id} {note}"));
     }
-    if stats.skipped > 0 && !stats.non_unicode.is_empty() {
+    if stats.non_unicode_total > 0 {
         logger.event(
             "skipped_non_unicode",
             &format!(
-                "snapshot={snapshot_id} names={}",
-                stats.non_unicode.join(" | ")
+                "snapshot={snapshot_id} names={} total={}",
+                stats.non_unicode.join(" | "),
+                stats.non_unicode_total
             ),
         );
     }
 
     let rollup_t0 = Instant::now();
-    rollup_snapshot(conn, snapshot_id)?;
+    if let Err(e) = rollup_snapshot(conn, snapshot_id) {
+        fail_snapshot(conn, snapshot_id, scan_ms);
+        logger.event("scan_failed", &format!("snapshot={snapshot_id} err={e}"));
+        return Err(e);
+    }
     let rollup_ms = rollup_t0.elapsed().as_millis() as u64;
 
     let finished_at = chrono::Utc::now().timestamp();
-    conn.execute(
+    let completed = conn.execute(
         "UPDATE arkos_snapshots
          SET state = 'complete', finished_at = ?1, files = ?2, dirs = ?3, bytes = ?4,
              denied = ?5, skipped = ?6, scan_ms = ?7, mode = ?8
@@ -248,8 +253,13 @@ pub fn run_scan_with_progress(
             ran_mode,
             snapshot_id,
         ],
-    )
-    .map_err(map_db_err)?;
+    );
+    if let Err(e) = completed {
+        let e = map_db_err(e);
+        fail_snapshot(conn, snapshot_id, scan_ms);
+        logger.event("scan_failed", &format!("snapshot={snapshot_id} err={e}"));
+        return Err(e);
+    }
 
     let warning = if stats.denied > 0 {
         Some(format!("{} directories were not readable", stats.denied))

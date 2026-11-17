@@ -36,13 +36,13 @@ fn dead_scan_is_abandoned_on_next_open_but_a_live_one_is_kept() {
     let live = insert_running(&env.conn, "dir:/live");
     let held = VolumeLock::acquire(&env.paths.locks, "dir:/live", 500).unwrap();
 
-    let conn2 = db::open_and_migrate(&env.paths.db, 1000).unwrap();
+    let conn2 = db::open_and_migrate(&env.paths.db, &env.paths.locks, 1000).unwrap();
     assert_eq!(state_of(&conn2, dead), "abandoned");
     assert_eq!(state_of(&conn2, live), "running");
 
     drop(held);
     drop(conn2);
-    let conn3 = db::open_and_migrate(&env.paths.db, 1000).unwrap();
+    let conn3 = db::open_and_migrate(&env.paths.db, &env.paths.locks, 1000).unwrap();
     assert_eq!(state_of(&conn3, live), "abandoned");
     let finished: Option<i64> = conn3
         .query_row(
@@ -170,7 +170,7 @@ fn failed_cleanup_leaves_running_and_the_next_open_abandons_it() {
         .unwrap();
     assert!(partial > 0, "the fixture should have committed a batch");
 
-    let conn2 = db::open_and_migrate(&env.paths.db, 1000).unwrap();
+    let conn2 = db::open_and_migrate(&env.paths.db, &env.paths.locks, 1000).unwrap();
     assert_eq!(state_of(&conn2, id), "abandoned");
 }
 
@@ -252,4 +252,113 @@ fn mode_resolution_table() {
     assert_eq!(ok(ScanMode::Mft, true, true, false), Err(Exit::Unsupported));
     assert_eq!(ok(ScanMode::Mft, false, true, true), Err(Exit::Unsupported));
     assert_eq!(ok(ScanMode::Mft, true, false, true), Err(Exit::Refused));
+}
+
+fn assert_failed_and_empty(env: &Env) {
+    let (state, id): (String, i64) = env
+        .conn
+        .query_row("SELECT state, id FROM arkos_snapshots", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(state, "failed");
+    for table in ["arkos_files", "arkos_dirs"] {
+        let n: i64 = env
+            .conn
+            .query_row(
+                &format!("SELECT count(*) FROM {table} WHERE snapshot_id = ?1"),
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0, "{table} kept rows");
+    }
+}
+
+fn small_tree(env: &Env) -> std::path::PathBuf {
+    let tree = env.root.join("small");
+    std::fs::create_dir_all(tree.join("sub")).unwrap();
+    std::fs::write(tree.join("sub/a.txt"), b"abc").unwrap();
+    tree
+}
+
+#[test]
+fn rollup_failure_marks_the_snapshot_failed_and_removes_its_rows() {
+    let mut env = Env::new("rollupfail");
+    let tree = small_tree(&env);
+    // Test-only trigger on the scratch ledger; the rollup is the first writer to update dirs.
+    env.conn
+        .execute_batch(
+            "CREATE TRIGGER no_rollup BEFORE UPDATE ON arkos_dirs
+             BEGIN SELECT RAISE(ABORT, 'rollup failed'); END;",
+        )
+        .unwrap();
+    run_walk(&mut env, &tree).unwrap_err();
+    assert_failed_and_empty(&env);
+}
+
+#[test]
+fn completion_update_failure_marks_the_snapshot_failed_and_removes_its_rows() {
+    let mut env = Env::new("completefail");
+    let tree = small_tree(&env);
+    env.conn
+        .execute_batch(
+            "CREATE TRIGGER no_complete BEFORE UPDATE ON arkos_snapshots
+             WHEN NEW.state = 'complete'
+             BEGIN SELECT RAISE(ABORT, 'cannot complete'); END;",
+        )
+        .unwrap();
+    run_walk(&mut env, &tree).unwrap_err();
+    assert_failed_and_empty(&env);
+}
+
+#[test]
+fn sweep_checks_the_given_locks_dir_and_leaves_the_lock_file_untouched() {
+    let env = Env::new("sweepfile");
+    let live = insert_running(&env.conn, "dir:/held");
+    let held = VolumeLock::acquire(&env.paths.locks, "dir:/held", 500).unwrap();
+    let lock_file = arkos::lock::lock_path_for(&env.paths.locks, "dir:/held");
+    let before = std::fs::read_to_string(&lock_file).unwrap();
+
+    let conn = db::open_and_migrate(&env.paths.db, &env.paths.locks, 1000).unwrap();
+    assert_eq!(state_of(&conn, live), "running");
+    assert_eq!(std::fs::read_to_string(&lock_file).unwrap(), before);
+
+    // A different, empty locks directory sees no holder, so the row is swept.
+    let other = env.root.join("elsewhere");
+    let conn2 = db::open_and_migrate(&env.paths.db, &other, 1000).unwrap();
+    assert_eq!(state_of(&conn2, live), "abandoned");
+    drop(held);
+}
+
+#[cfg(unix)]
+#[test]
+fn non_unicode_log_lists_at_most_fifty_names_and_the_true_total() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut env = Env::new("nonutf8cap");
+    let tree = env.root.join("tree");
+    std::fs::create_dir_all(&tree).unwrap();
+    for i in 0..60u8 {
+        std::fs::write(
+            tree.join(OsStr::from_bytes(&[
+                b'n',
+                0xff,
+                b'0' + i % 10,
+                b'a' + i / 10,
+            ])),
+            b"x",
+        )
+        .unwrap();
+    }
+    let rep = env.scan(&tree);
+    assert_eq!(rep.skipped, 60);
+    let log = std::fs::read_to_string(env.paths.logs.join("arkos.log")).unwrap();
+    let line = log
+        .lines()
+        .find(|l| l.contains("skipped_non_unicode"))
+        .unwrap();
+    assert!(line.contains("total=60"), "{line}");
+    assert_eq!(line.matches('\u{fffd}').count(), 50, "{line}");
 }

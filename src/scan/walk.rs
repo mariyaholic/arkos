@@ -30,6 +30,8 @@ pub struct WalkStats {
     pub skipped: u64,
     /// Lossy forms of entries skipped because their names are not valid Unicode (capped).
     pub non_unicode: Vec<String>,
+    /// How many entries were skipped for non-Unicode names, including those not listed.
+    pub non_unicode_total: u64,
 }
 
 /// What the walk leaves out: name or path globs, and exact directories.
@@ -170,7 +172,7 @@ pub fn walk_into_snapshot(
     let next_token = Arc::new(AtomicU64::new(2));
     let denied = Arc::new(AtomicU64::new(0));
     let skipped = Arc::new(AtomicU64::new(0));
-    let non_unicode = Arc::new(Mutex::new(Vec::<String>::new()));
+    let non_unicode = Arc::new(Mutex::new((0u64, Vec::<String>::new())));
     let (tx, rx) = mpsc::sync_channel::<WriterMsg>(64);
 
     let mut stats = WalkStats::default();
@@ -213,7 +215,11 @@ pub fn walk_into_snapshot(
 
     stats.denied = denied.load(Ordering::Acquire);
     stats.skipped = skipped.load(Ordering::Acquire);
-    stats.non_unicode = non_unicode.lock().expect("non-unicode list").clone();
+    {
+        let guard = non_unicode.lock().expect("non-unicode list");
+        stats.non_unicode_total = guard.0;
+        stats.non_unicode = guard.1.clone();
+    }
     stats.non_unicode.sort();
     Ok(stats)
 }
@@ -226,7 +232,7 @@ fn process_dir(
     next_token: &AtomicU64,
     denied: &AtomicU64,
     skipped: &AtomicU64,
-    non_unicode: &Mutex<Vec<String>>,
+    non_unicode: &Mutex<(u64, Vec<String>)>,
     tx: &mpsc::SyncSender<WriterMsg>,
 ) {
     let open_path = to_os_open_path(&item.path);
@@ -279,8 +285,9 @@ fn process_dir(
             Err(raw) => {
                 skipped.fetch_add(1, Ordering::Relaxed);
                 let mut names = non_unicode.lock().expect("non-unicode list");
-                if names.len() < MAX_LOGGED_NAMES {
-                    names.push(format!(
+                names.0 += 1;
+                if names.1.len() < MAX_LOGGED_NAMES {
+                    names.1.push(format!(
                         "{}{}{}",
                         normalize_display_path(&item.path),
                         std::path::MAIN_SEPARATOR,
@@ -492,16 +499,17 @@ fn modified_epoch(meta: &Metadata) -> Option<i64> {
 }
 
 fn is_reparse_or_symlink(meta: &Metadata) -> bool {
-    if meta.file_type().is_symlink() {
-        return true;
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
-        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return true;
-        }
-    }
+    meta.file_type().is_symlink() || has_reparse_attr(meta)
+}
+
+#[cfg(windows)]
+fn has_reparse_attr(meta: &Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn has_reparse_attr(_meta: &Metadata) -> bool {
     false
 }
