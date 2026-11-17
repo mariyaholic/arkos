@@ -19,8 +19,13 @@ fn report_has_a_nested_map_with_hover_titles_and_no_scripts() {
         },
     )
     .unwrap();
-    // A name that must stay escaped everywhere it appears in the map.
-    let nasty = tree.join("a<b>&\"q\"");
+    // A name that must stay escaped everywhere it appears in the map. Windows does not allow
+    // `<`, `>` or `"` in file names, so it gets the escapable characters it does allow.
+    #[cfg(not(windows))]
+    let (name, escaped) = ("a<b>&\"q\"", "a&lt;b&gt;&amp;&quot;q&quot;");
+    #[cfg(windows)]
+    let (name, escaped) = ("a&b'q", "a&amp;b&#39;q");
+    let nasty = tree.join(name);
     std::fs::create_dir_all(nasty.join("inner")).unwrap();
     support::fixture::write_sparse(&nasty.join("inner/big.bin"), 64 * 1024 * 1024).unwrap();
     let s = env.scan(&tree);
@@ -45,7 +50,7 @@ fn report_has_a_nested_map_with_hover_titles_and_no_scripts() {
     assert!(svg.contains("files here"));
 
     // Escaping and policy.
-    assert!(svg.contains("a&lt;b&gt;&amp;&quot;q&quot;"));
+    assert!(svg.contains(escaped), "escaped name {escaped} missing");
     assert!(!html.contains("<script"));
     assert!(!html.contains("http://") && !html.contains("https://"));
     assert!(!svg.contains("lining") && !svg.contains("wine"));
