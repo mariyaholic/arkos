@@ -95,9 +95,13 @@ pub struct PruneCandidate {
     pub bytes: i64,
 }
 
-/// List the snapshots a prune would delete: completed ones beyond the newest `keep` per volume.
+/// List the snapshots a prune would delete.
 ///
-/// `running` snapshots are never candidates. [`prune_completed`] deletes exactly this list.
+/// Snapshots are grouped by `(volume, root)`, so a subtree scan never pushes out a full-volume
+/// snapshot. In each group the newest `keep` completed snapshots stay, older completed ones are
+/// candidates, and `failed` or `abandoned` rows older than the `keep`th newest completed one are
+/// candidates too. `running` snapshots are never candidates. [`prune_completed`] deletes exactly
+/// this list.
 pub fn plan_prune(
     conn: &Connection,
     volume_filter: Option<&str>,
@@ -105,19 +109,13 @@ pub fn plan_prune(
 ) -> Result<Vec<PruneCandidate>> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, volume, root, state, started_at, bytes FROM (
-               SELECT id, volume, root, state, started_at, bytes,
-                      ROW_NUMBER() OVER (
-                        PARTITION BY volume ORDER BY started_at DESC, id DESC
-                      ) AS rn
-               FROM arkos_snapshots
-               WHERE state = 'complete' AND (?1 IS NULL OR volume = ?1)
-             ) WHERE rn > ?2
-             ORDER BY volume, started_at DESC, id DESC",
+            "SELECT id, volume, root, state, started_at, bytes FROM arkos_snapshots
+             WHERE state <> 'running' AND (?1 IS NULL OR volume = ?1)
+             ORDER BY volume, root, started_at DESC, id DESC",
         )
         .map_err(map_db_err)?;
     let rows = stmt
-        .query_map(params![volume_filter, keep as i64], |r| {
+        .query_map(params![volume_filter], |r| {
             Ok(PruneCandidate {
                 id: r.get(0)?,
                 volume: r.get(1)?,
@@ -128,14 +126,52 @@ pub fn plan_prune(
             })
         })
         .map_err(map_db_err)?;
-    let mut out = Vec::new();
+    let mut all = Vec::new();
     for row in rows {
-        out.push(row.map_err(map_db_err)?);
+        all.push(row.map_err(map_db_err)?);
+    }
+
+    let keep = keep as usize;
+    let mut out = Vec::new();
+    let mut start = 0;
+    while start < all.len() {
+        let mut end = start + 1;
+        while end < all.len()
+            && all[end].volume == all[start].volume
+            && all[end].root == all[start].root
+        {
+            end += 1;
+        }
+        let group = &all[start..end];
+        let complete: Vec<&PruneCandidate> =
+            group.iter().filter(|c| c.state == "complete").collect();
+        // The cut: rows ordered before the `keep`th newest completed snapshot are older than it.
+        let cut = if keep == 0 {
+            None
+        } else {
+            complete.get(keep - 1).map(|c| (c.started_at, c.id))
+        };
+        for c in group {
+            let drop_it = if c.state == "complete" {
+                complete
+                    .iter()
+                    .position(|x| x.id == c.id)
+                    .is_some_and(|rank| rank >= keep)
+            } else if keep == 0 {
+                true
+            } else {
+                cut.is_some_and(|cut| (c.started_at, c.id) < cut)
+            };
+            if drop_it {
+                out.push(c.clone());
+            }
+        }
+        start = end;
     }
     Ok(out)
 }
 
-/// Delete old completed snapshots beyond `keep`, leaving `running` snapshots untouched.
+/// Delete the snapshots [`plan_prune`] lists, leaving `running` snapshots untouched.
 ///
 /// Only runs `PRAGMA incremental_vacuum(2048)` when freelist exceeds 32 MiB; never runs full `VACUUM`.
 pub fn prune_completed(conn: &Connection, volume_filter: Option<&str>, keep: u32) -> Result<usize> {

@@ -87,6 +87,7 @@ pub struct ScanReport {
     pub scan_ms: u64,
     pub rollup_ms: u64,
     pub warning: Option<String>,
+    pub size_basis: &'static str,
 }
 
 /// Execute a full snapshot scan against `volume` (and optional `subpath`), returning `ScanReport`.
@@ -269,6 +270,7 @@ pub fn run_scan_with_progress(
         scan_ms,
         rollup_ms,
         warning,
+        size_basis: crate::fmt::SIZE_BASIS,
     })
 }
 

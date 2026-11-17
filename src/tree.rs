@@ -7,7 +7,7 @@
 use crate::db::map_db_err;
 use crate::exit::{Error, Result};
 pub use crate::fmt::format_size;
-use crate::fmt::join_display;
+use crate::fmt::{join_display, SIZE_NOTE};
 use rusqlite::{params, Connection};
 use std::fmt::Write;
 use std::path::Path;
@@ -31,6 +31,7 @@ h1{margin:.25rem 0 .5rem;font:600 clamp(1.4rem,3.4vw,2.1rem) var(--font-display)
 h2{margin:2.5rem 0 .75rem;font:600 1rem var(--font-body);color:var(--platinum);letter-spacing:.02em}
 .meta{display:flex;flex-wrap:wrap;gap:8px 24px;margin:0;padding:0;list-style:none;font:.8rem var(--font-mono);color:var(--muted)}
 .meta b{color:var(--gold-bright);font-weight:500}
+.note{margin:.75rem 0 0;color:var(--muted);font-size:.8rem}
 .warn{margin:1rem 0 0;padding:8px 12px;border-left:3px solid var(--lining);background:var(--lining-dim);color:var(--platinum);border-radius:var(--radius-sm)}
 .panel{margin-top:1.5rem;padding:16px;background:var(--bg-panel);border:1px solid var(--line);border-radius:var(--radius-lg)}
 svg{display:block;width:100%;height:auto}
@@ -180,6 +181,8 @@ pub fn render_tree_html(conn: &Connection, snapshot_id: i64, max_depth: i32) -> 
         )
         .ok();
     }
+
+    writeln!(html, "<p class=\"note\">{}</p>", html_escape(SIZE_NOTE)).ok();
 
     // Deterministic horizontal strip treemap over the largest top-level folders.
     let top: Vec<&(String, String, i32, i64, i64)> =

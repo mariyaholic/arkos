@@ -1,5 +1,13 @@
 //! Text formatting shared by the CLI and the HTML report: sizes and display paths.
 
+/// How sizes are counted, printed with every report. Schema 0001 stores logical size only.
+pub const SIZE_NOTE: &str = "Sizes are logical and counted per name. Hardlinked files may be \
+counted more than once, and allocated size may be smaller for compressed, sparse or cloud \
+placeholder files.";
+
+/// Value of the `size_basis` field in JSON scan output.
+pub const SIZE_BASIS: &str = "logical_per_name";
+
 /// Format a byte count in binary units (`B`, `KiB`, `MiB`, `GiB`, `TiB`).
 ///
 /// Values under 1 KiB print as whole bytes; larger values keep one decimal. Negative values keep

@@ -37,13 +37,32 @@ pub fn normalize_display_path(path: &Path) -> String {
     raw.into_owned()
 }
 
-/// Extract lowercased extension without dot (`None` for extensionless or leading-dot dotfiles).
+/// Archive suffixes kept whole, so `backup.tar.gz` groups as `tar.gz` and not `gz`.
+const COMPOUND_EXTS: [&str; 7] = [
+    "tar.gz", "tar.bz2", "tar.xz", "tar.zst", "tar.lz", "tar.lzma", "tar.z",
+];
+
+/// Extract the lowercased extension without a dot (`None` for extensionless names, leading-dot
+/// dotfiles and a trailing dot).
+///
+/// A fixed list of compound archive suffixes is stored whole; every other name keeps the text
+/// after its last dot. A name must be longer than the suffix plus its dot to count, so a file
+/// named exactly `.tar.gz` is treated as the dotfile it is and falls through to the last dot.
 pub fn normalize_ext(file_name: &str) -> Option<String> {
+    let lower = file_name.to_ascii_lowercase();
+    for suffix in COMPOUND_EXTS {
+        if lower.len() > suffix.len() + 1
+            && lower.ends_with(suffix)
+            && lower.as_bytes()[lower.len() - suffix.len() - 1] == b'.'
+        {
+            return Some(suffix.to_owned());
+        }
+    }
     let dot = file_name.rfind('.')?;
     if dot == 0 || dot + 1 >= file_name.len() {
         return None;
     }
-    Some(file_name[dot + 1..].to_ascii_lowercase())
+    Some(lower[dot + 1..].to_owned())
 }
 
 /// Simple case-insensitive `*` / `?` glob matching for `--exclude`.
@@ -92,10 +111,34 @@ mod tests {
     #[test]
     fn ext_normalizes_lowercase_and_ignores_dotfiles() {
         assert_eq!(normalize_ext("Photo.JPG").as_deref(), Some("jpg"));
-        assert_eq!(normalize_ext("archive.tar.GZ").as_deref(), Some("gz"));
+        assert_eq!(normalize_ext("archive.tar.GZ").as_deref(), Some("tar.gz"));
         assert_eq!(normalize_ext("Makefile"), None);
         assert_eq!(normalize_ext(".gitignore"), None);
         assert_eq!(normalize_ext("trailing."), None);
+    }
+
+    #[test]
+    fn compound_archive_extensions_are_stored_whole() {
+        for (name, want) in [
+            ("a.tar.gz", "tar.gz"),
+            ("a.tar.bz2", "tar.bz2"),
+            ("a.TAR.XZ", "tar.xz"),
+            ("a.tar.zst", "tar.zst"),
+            ("a.tar.lz", "tar.lz"),
+            ("a.tar.lzma", "tar.lzma"),
+            ("a.tar.z", "tar.z"),
+            ("many.dots.in.name.tar.gz", "tar.gz"),
+        ] {
+            assert_eq!(normalize_ext(name).as_deref(), Some(want), "{name}");
+        }
+        // Not on the list, or no separating dot, or nothing before the suffix.
+        assert_eq!(normalize_ext("a.tar.7z").as_deref(), Some("7z"));
+        assert_eq!(normalize_ext("atar.gz").as_deref(), Some("gz"));
+        assert_eq!(normalize_ext("a.tgz").as_deref(), Some("tgz"));
+        assert_eq!(normalize_ext(".tar.gz").as_deref(), Some("gz"));
+        assert_eq!(normalize_ext("tar.gz").as_deref(), Some("gz"));
+        assert_eq!(normalize_ext("x.tar.gz.").as_deref(), None);
+        assert_eq!(normalize_ext("archive.tar").as_deref(), Some("tar"));
     }
 
     #[test]

@@ -89,7 +89,7 @@ enum Command {
         #[arg(long, default_value_t = 4)]
         depth: i32,
     },
-    /// Delete old completed snapshots while keeping the newest N per volume.
+    /// Delete old completed snapshots while keeping the newest N per volume and root.
     Prune {
         #[arg(long)]
         keep: Option<u32>,
@@ -237,6 +237,7 @@ fn try_run() -> Result<Exit> {
                 if let Some(w) = report.warning {
                     println!("warning: {w}");
                 }
+                println!("note: {}", crate::fmt::SIZE_NOTE);
             }
             Ok(Exit::Ok)
         }
@@ -372,7 +373,7 @@ fn try_run() -> Result<Exit> {
                     );
                 } else {
                     println!(
-                        "pruned {deleted} snapshot(s), kept latest {keep} complete per volume"
+                        "pruned {deleted} snapshot(s), kept latest {keep} complete per volume and root"
                     );
                 }
                 return Ok(Exit::Ok);
@@ -385,7 +386,7 @@ fn try_run() -> Result<Exit> {
                 );
             } else {
                 println!(
-                    "would delete {} snapshot(s), keeping latest {keep} complete per volume",
+                    "would delete {} snapshot(s), keeping latest {keep} complete per volume and root",
                     plan.len()
                 );
                 for c in &plan {
