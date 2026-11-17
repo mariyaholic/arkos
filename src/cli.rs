@@ -4,10 +4,12 @@ use crate::config::Config;
 use crate::db::{self, map_db_err};
 use crate::diff::diff_snapshots;
 use crate::exit::{Error, Exit, Result};
+use crate::fmt::{format_delta, format_size};
 use crate::logging::Logger;
 use crate::paths::{PathEnvironment, Paths};
 use crate::probe::{build_probe_doc, status_probe_exit};
-use crate::scan::{run_scan, ScanMode};
+use crate::progress::Reporter;
+use crate::scan::{run_scan_with_progress, ScanMode};
 use crate::top::{query_top, TopBy};
 use crate::tree::write_tree_file;
 use clap::{Parser, Subcommand};
@@ -95,6 +97,9 @@ enum Command {
         volume: Option<String>,
         #[arg(long)]
         yes: bool,
+        /// Print what would be deleted and exit 0 without deleting.
+        #[arg(long, conflicts_with = "yes")]
+        dry_run: bool,
         #[arg(long)]
         json: bool,
     },
@@ -199,7 +204,8 @@ fn try_run() -> Result<Exit> {
             json,
         } => {
             let mut conn = db::open_and_migrate(&paths.db, config.busy_timeout_ms)?;
-            let report = run_scan(
+            let mut progress = Reporter::auto(json);
+            let report = run_scan_with_progress(
                 &mut conn,
                 &paths,
                 &config,
@@ -209,6 +215,7 @@ fn try_run() -> Result<Exit> {
                 label.as_deref(),
                 mode,
                 &excludes,
+                &mut progress,
             )?;
             if json {
                 println!(
@@ -217,13 +224,13 @@ fn try_run() -> Result<Exit> {
                 );
             } else {
                 println!(
-                    "snapshot={} volume={} mode={} dirs={} files={} bytes={} scan_ms={} rollup_ms={}",
+                    "snapshot={} volume={} mode={} dirs={} files={} size={} scan_ms={} rollup_ms={}",
                     report.snapshot_id,
                     report.volume,
                     report.mode,
                     report.dirs,
                     report.files,
-                    report.bytes,
+                    format_size(report.bytes.min(i64::MAX as u64) as i64),
                     report.scan_ms,
                     report.rollup_ms
                 );
@@ -248,8 +255,15 @@ fn try_run() -> Result<Exit> {
             } else {
                 for r in rows {
                     println!(
-                        "#{:<4} {:<6} {:<10} {:<5} {:>10} files {:>12} B  denied={}  {}",
-                        r.id, r.volume, r.state, r.mode, r.files, r.bytes, r.denied, r.root
+                        "#{:<4} {:<6} {:<10} {:<5} {:>10} files {:>11}  denied={}  {}",
+                        r.id,
+                        r.volume,
+                        r.state,
+                        r.mode,
+                        r.files,
+                        format_size(r.bytes),
+                        r.denied,
+                        r.root
                     );
                 }
             }
@@ -288,10 +302,20 @@ fn try_run() -> Result<Exit> {
                     report.snapshot_a, report.snapshot_b, report.volume
                 );
                 for d in &report.dirs {
-                    println!("dir  {:?} {:>+12} B  {}", d.kind, d.delta_bytes, d.path);
+                    println!(
+                        "dir  {:<7} {:>11}  {}",
+                        format!("{:?}", d.kind),
+                        format_delta(d.delta_bytes),
+                        d.path
+                    );
                 }
                 for f in &report.files {
-                    println!("file {:?} {:>+12} B  {}", f.kind, f.delta_bytes, f.path);
+                    println!(
+                        "file {:<7} {:>11}  {}",
+                        format!("{:?}", f.kind),
+                        format_delta(f.delta_bytes),
+                        f.path
+                    );
                 }
             }
             Ok(Exit::Ok)
@@ -312,7 +336,7 @@ fn try_run() -> Result<Exit> {
                 );
             } else {
                 for item in items {
-                    println!("{:>12} B  {}", item.bytes, item.path);
+                    println!("{:>11}  {}", format_size(item.bytes), item.path);
                 }
             }
             Ok(Exit::Ok)
@@ -331,26 +355,54 @@ fn try_run() -> Result<Exit> {
             keep,
             volume,
             yes,
+            dry_run,
             json,
         } => {
-            if !yes {
-                return Err(Error::Cli("prune requires --yes".into()));
-            }
             let keep = keep.unwrap_or(config.snapshots_keep);
             if !(1..=12).contains(&keep) {
                 return Err(Error::Cli("--keep must be between 1 and 12".into()));
             }
             let conn = db::open_and_migrate(&paths.db, config.busy_timeout_ms)?;
-            let deleted = db::retention::prune_completed(&conn, volume.as_deref(), keep)?;
+            if yes {
+                let deleted = db::retention::prune_completed(&conn, volume.as_deref(), keep)?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({ "deleted_snapshots": deleted, "keep": keep })
+                    );
+                } else {
+                    println!(
+                        "pruned {deleted} snapshot(s), kept latest {keep} complete per volume"
+                    );
+                }
+                return Ok(Exit::Ok);
+            }
+            let plan = db::retention::plan_prune(&conn, volume.as_deref(), keep)?;
             if json {
                 println!(
                     "{}",
-                    serde_json::json!({ "deleted_snapshots": deleted, "keep": keep })
+                    serde_json::json!({ "dry_run": dry_run, "keep": keep, "candidates": plan })
                 );
             } else {
-                println!("pruned {deleted} snapshot(s), kept latest {keep} complete per volume");
+                println!(
+                    "would delete {} snapshot(s), keeping latest {keep} complete per volume",
+                    plan.len()
+                );
+                for c in &plan {
+                    println!(
+                        "  #{:<4} {:<6} {:>11}  {}",
+                        c.id,
+                        c.volume,
+                        format_size(c.bytes),
+                        c.root
+                    );
+                }
             }
-            Ok(Exit::Ok)
+            if dry_run {
+                Ok(Exit::Ok)
+            } else {
+                Err(Error::Cli("nothing deleted; pass --yes to delete these snapshots, or --dry-run to preview".into()))
+            }
         }
         Command::Status { probe, json } => {
             let conn = db::open_and_migrate(&paths.db, config.busy_timeout_ms)?;

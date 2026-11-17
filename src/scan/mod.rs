@@ -10,8 +10,10 @@ use crate::exit::{Error, Result};
 use crate::lock::VolumeLock;
 use crate::logging::Logger;
 use crate::paths::Paths;
+use crate::progress::Reporter;
 use crate::rollup::rollup_snapshot;
 use crate::scan::paths::normalize_display_path;
+use crate::scan::walk::WalkStats;
 use crate::volumes::{is_elevated, is_ntfs, resolve_target};
 use clap::ValueEnum;
 use rusqlite::{params, Connection};
@@ -46,6 +48,13 @@ impl ScanMode {
     }
 }
 
+/// What a scanner returns: the totals and the path that actually ran (`mft` or `walk`).
+#[derive(Debug)]
+pub struct ScanOutcome {
+    pub stats: WalkStats,
+    pub mode: &'static str,
+}
+
 /// Outcome returned after completing a snapshot scan.
 #[derive(Debug, Serialize)]
 pub struct ScanReport {
@@ -75,6 +84,34 @@ pub fn run_scan(
     label: Option<&str>,
     mode: ScanMode,
     extra_excludes: &[String],
+) -> Result<ScanReport> {
+    run_scan_with_progress(
+        conn,
+        paths,
+        config,
+        logger,
+        volume_arg,
+        subpath,
+        label,
+        mode,
+        extra_excludes,
+        &mut Reporter::off(),
+    )
+}
+
+/// Same as [`run_scan`], reporting progress through `progress`.
+#[allow(clippy::too_many_arguments)]
+pub fn run_scan_with_progress(
+    conn: &mut Connection,
+    paths: &Paths,
+    config: &Config,
+    logger: &Logger,
+    volume_arg: &str,
+    subpath: Option<&Path>,
+    label: Option<&str>,
+    mode: ScanMode,
+    extra_excludes: &[String],
+    progress: &mut Reporter,
 ) -> Result<ScanReport> {
     let target = resolve_target(volume_arg, subpath)?;
     let _lock = VolumeLock::acquire(&paths.locks, &target.volume, config.busy_timeout_ms)?;
@@ -117,14 +154,23 @@ pub fn run_scan(
     excludes.extend_from_slice(extra_excludes);
 
     let scan_t0 = Instant::now();
-    let walk_res = match resolved_mode {
-        "mft" => mft::mft_into_snapshot(conn, snapshot_id, &target.root, &excludes),
-        _ => walk::walk_into_snapshot(conn, snapshot_id, &target.root, &excludes),
+    let scan_res = match resolved_mode {
+        "mft" => mft::mft_into_snapshot(conn, snapshot_id, &target.root, &excludes, progress),
+        _ => walk::walk_into_snapshot(conn, snapshot_id, &target.root, &excludes, progress).map(
+            |stats| ScanOutcome {
+                stats,
+                mode: "walk",
+            },
+        ),
     };
+    progress.finish();
     let scan_ms = scan_t0.elapsed().as_millis() as u64;
 
-    let stats = match walk_res {
-        Ok(s) => s,
+    let ScanOutcome {
+        stats,
+        mode: ran_mode,
+    } = match scan_res {
+        Ok(o) => o,
         Err(e) => {
             let now = chrono::Utc::now().timestamp();
             let _ = conn.execute(
@@ -144,8 +190,8 @@ pub fn run_scan(
     conn.execute(
         "UPDATE arkos_snapshots
          SET state = 'complete', finished_at = ?1, files = ?2, dirs = ?3, bytes = ?4,
-             denied = ?5, skipped = ?6, scan_ms = ?7
-         WHERE id = ?8",
+             denied = ?5, skipped = ?6, scan_ms = ?7, mode = ?8
+         WHERE id = ?9",
         params![
             finished_at,
             stats.files as i64,
@@ -154,6 +200,7 @@ pub fn run_scan(
             stats.denied as i64,
             stats.skipped as i64,
             scan_ms as i64,
+            ran_mode,
             snapshot_id,
         ],
     )
@@ -168,7 +215,7 @@ pub fn run_scan(
     logger.event(
         "scan_complete",
         &format!(
-            "snapshot={snapshot_id} volume={} mode={resolved_mode} files={} dirs={} bytes={} denied={} scan_ms={scan_ms} rollup_ms={rollup_ms}",
+            "snapshot={snapshot_id} volume={} mode={ran_mode} files={} dirs={} bytes={} denied={} scan_ms={scan_ms} rollup_ms={rollup_ms}",
             target.volume, stats.files, stats.dirs, stats.bytes, stats.denied
         ),
     );
@@ -177,7 +224,7 @@ pub fn run_scan(
         snapshot_id,
         volume: target.volume,
         root: root_str,
-        mode: resolved_mode.to_owned(),
+        mode: ran_mode.to_owned(),
         dirs: stats.dirs,
         files: stats.files,
         bytes: stats.bytes,

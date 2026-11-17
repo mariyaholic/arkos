@@ -2,6 +2,7 @@
 
 use crate::db::map_db_err;
 use crate::exit::{Error, Result};
+use crate::progress::Reporter;
 use crate::scan::paths::{
     matches_any_exclude, normalize_display_path, normalize_ext, to_os_open_path,
 };
@@ -116,6 +117,7 @@ pub fn walk_into_snapshot(
     snapshot_id: i64,
     root: &Path,
     excludes: &[String],
+    progress: &mut Reporter,
 ) -> Result<WalkStats> {
     let root_meta = fs::symlink_metadata(to_os_open_path(root)).map_err(|source| Error::Io {
         context: "stat scan root",
@@ -160,7 +162,7 @@ pub fn walk_into_snapshot(
         }
         drop(tx);
 
-        match consume_and_insert(conn, snapshot_id, rx) {
+        match consume_and_insert(conn, snapshot_id, rx, progress) {
             Ok((dirs, files, bytes)) => {
                 stats.dirs = dirs;
                 stats.files = files;
@@ -307,6 +309,7 @@ fn consume_and_insert(
     conn: &mut Connection,
     snapshot_id: i64,
     rx: mpsc::Receiver<WriterMsg>,
+    progress: &mut Reporter,
 ) -> Result<(u64, u64, u64)> {
     let mut dirs = 0u64;
     let mut files = 0u64;
@@ -381,6 +384,7 @@ fn consume_and_insert(
             token_to_id.insert(node.token, dir_id);
             dirs += 1;
             ops_in_tx += 1;
+            progress.tick(files, dirs, bytes);
 
             if !node.files.is_empty() {
                 let mut stmt = tx

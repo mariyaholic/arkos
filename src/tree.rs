@@ -6,6 +6,8 @@
 
 use crate::db::map_db_err;
 use crate::exit::{Error, Result};
+pub use crate::fmt::format_size;
+use crate::fmt::join_display;
 use rusqlite::{params, Connection};
 use std::fmt::Write;
 use std::path::Path;
@@ -89,21 +91,6 @@ pub fn relative(path: &str, root: &str) -> String {
         }
         _ => path.to_string(),
     }
-}
-
-/// Format a byte count in binary units (`B`, `KiB`, `MiB`, `GiB`, `TiB`).
-pub fn format_size(bytes: i64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    if bytes.unsigned_abs() < 1024 {
-        return format!("{bytes} B");
-    }
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value.abs() >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    format!("{value:.1} {}", UNITS[unit])
 }
 
 /// Render a static HTML + SVG report for `snapshot_id` up to `max_depth`.
@@ -260,12 +247,7 @@ pub fn render_tree_html(conn: &Connection, snapshot_id: i64, max_depth: i32) -> 
     )
     .ok();
     for (dir_path, name, size) in &files {
-        let sep = if dir_path.ends_with(['\\', '/']) {
-            ""
-        } else {
-            "\\"
-        };
-        let full = format!("{dir_path}{sep}{name}");
+        let full = join_display(dir_path, name);
         writeln!(
             html,
             "<tr><td class=\"path\" title=\"{}\">{}</td><td class=\"num\" title=\"{size} B\">{}</td></tr>",
@@ -308,15 +290,6 @@ pub fn write_tree_file(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn format_size_uses_binary_units() {
-        assert_eq!(format_size(0), "0 B");
-        assert_eq!(format_size(1023), "1023 B");
-        assert_eq!(format_size(1024), "1.0 KiB");
-        assert_eq!(format_size(5 * 1024 * 1024 + 512 * 1024), "5.5 MiB");
-        assert_eq!(format_size(3 * 1024_i64.pow(4)), "3.0 TiB");
-    }
 
     #[test]
     fn relative_strips_the_root_only_at_a_separator() {

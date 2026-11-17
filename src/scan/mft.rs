@@ -1,7 +1,9 @@
 //! Elevation-gated NTFS MFT accelerator (§5.2) with explicit refusal / unsupported exits.
 
 use crate::exit::{Error, Result};
-use crate::scan::walk::{walk_into_snapshot, WalkStats};
+use crate::progress::Reporter;
+use crate::scan::walk::walk_into_snapshot;
+use crate::scan::ScanOutcome;
 use rusqlite::Connection;
 use std::path::Path;
 
@@ -34,17 +36,19 @@ pub fn ensure_mft_ready(root: &Path) -> Result<()> {
 
 /// Run an elevated NTFS MFT pass when available.
 ///
-/// NOTE: Even when compiled with `mft`, calling unelevated refuses cleanly (exit 4),
-/// and non-MFT builds return Unsupported (exit 5). When elevated on NTFS, performs
-/// `FSCTL_ENUM_USN_DATA` two-phase enumeration when reading a volume root, or falls
-/// back cleanly to walk mechanics on subtrees while stamping `mode='mft'` after passing
-/// the pre-flight check.
+/// The returned outcome names the path that ran. Until the USN reader lands this walks and says
+/// `walk`, so the snapshot never claims `mft` for a walk.
 pub fn mft_into_snapshot(
     conn: &mut Connection,
     snapshot_id: i64,
     root: &Path,
     excludes: &[String],
-) -> Result<WalkStats> {
+    progress: &mut Reporter,
+) -> Result<ScanOutcome> {
     ensure_mft_ready(root)?;
-    walk_into_snapshot(conn, snapshot_id, root, excludes)
+    let stats = walk_into_snapshot(conn, snapshot_id, root, excludes, progress)?;
+    Ok(ScanOutcome {
+        stats,
+        mode: "walk",
+    })
 }

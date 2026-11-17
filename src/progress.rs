@@ -1,0 +1,133 @@
+//! Throttled scan progress on stderr.
+
+use std::io::{IsTerminal, Write};
+use std::time::{Duration, Instant};
+
+const INTERVAL: Duration = Duration::from_millis(500);
+
+/// Prints `scanned N files, M dirs, X` on one overwritten line at most every 500 ms.
+///
+/// A reporter built with [`Reporter::auto`] is silent unless stderr is a terminal and the caller
+/// is not producing JSON. Silent reporters cost one boolean check per tick.
+pub struct Reporter {
+    sink: Option<Box<dyn Write + Send>>,
+    interval: Duration,
+    last: Option<Instant>,
+    printed: bool,
+}
+
+impl Reporter {
+    /// A reporter that never prints.
+    pub fn off() -> Self {
+        Self {
+            sink: None,
+            interval: INTERVAL,
+            last: None,
+            printed: false,
+        }
+    }
+
+    /// Print to stderr when it is a terminal and `json` output is not requested.
+    pub fn auto(json: bool) -> Self {
+        if !json && std::io::stderr().is_terminal() {
+            Self::to_writer(Box::new(std::io::stderr()), INTERVAL)
+        } else {
+            Self::off()
+        }
+    }
+
+    /// Print to `sink`, at most once per `interval`.
+    pub fn to_writer(sink: Box<dyn Write + Send>, interval: Duration) -> Self {
+        Self {
+            sink: Some(sink),
+            interval,
+            last: None,
+            printed: false,
+        }
+    }
+
+    /// Report current totals; prints only when the interval has passed since the last line.
+    pub fn tick(&mut self, files: u64, dirs: u64, bytes: u64) {
+        if self.sink.is_none() {
+            return;
+        }
+        let now = Instant::now();
+        if let Some(last) = self.last {
+            if now.duration_since(last) < self.interval {
+                return;
+            }
+        }
+        self.last = Some(now);
+        let line = format!(
+            "scanned {files} files, {dirs} dirs, {}",
+            crate::fmt::format_size(bytes.min(i64::MAX as u64) as i64)
+        );
+        if let Some(sink) = self.sink.as_mut() {
+            let _ = write!(sink, "\r{line}\x1b[K");
+            let _ = sink.flush();
+            self.printed = true;
+        }
+    }
+
+    /// Clear the progress line, if one was printed.
+    pub fn finish(&mut self) {
+        if !self.printed {
+            return;
+        }
+        if let Some(sink) = self.sink.as_mut() {
+            let _ = write!(sink, "\r\x1b[K");
+            let _ = sink.flush();
+        }
+        self.printed = false;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    struct Shared(Arc<Mutex<Vec<u8>>>);
+    impl Write for Shared {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn text(buf: &Arc<Mutex<Vec<u8>>>) -> String {
+        String::from_utf8(buf.lock().unwrap().clone()).unwrap()
+    }
+
+    #[test]
+    fn off_reporter_prints_nothing() {
+        let mut r = Reporter::off();
+        r.tick(1, 1, 1);
+        r.finish();
+    }
+
+    #[test]
+    fn ticks_inside_the_interval_are_dropped() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let mut r = Reporter::to_writer(Box::new(Shared(buf.clone())), Duration::from_secs(3600));
+        r.tick(10, 2, 2048);
+        r.tick(20, 4, 4096);
+        let out = text(&buf);
+        assert_eq!(out.matches("scanned").count(), 1);
+        assert!(out.contains("scanned 10 files, 2 dirs, 2.0 KiB"));
+    }
+
+    #[test]
+    fn zero_interval_prints_every_tick_and_finish_clears() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let mut r = Reporter::to_writer(Box::new(Shared(buf.clone())), Duration::ZERO);
+        r.tick(1, 1, 0);
+        r.tick(2, 1, 0);
+        assert_eq!(text(&buf).matches("scanned").count(), 2);
+        r.finish();
+        assert!(text(&buf).ends_with("\r\x1b[K"));
+    }
+}

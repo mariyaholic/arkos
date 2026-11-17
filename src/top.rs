@@ -2,6 +2,7 @@
 
 use crate::db::map_db_err;
 use crate::exit::{Error, Result};
+use crate::fmt::join_display;
 use clap::ValueEnum;
 use rusqlite::{params, Connection};
 use serde::Serialize;
@@ -94,13 +95,8 @@ pub fn query_top(
             .query_map(params![snapshot_id, limit as i64], |r| {
                 let dir_path: String = r.get(0)?;
                 let name: String = r.get(1)?;
-                let sep = if dir_path.ends_with(['\\', '/']) {
-                    ""
-                } else {
-                    "\\"
-                };
                 Ok(TopItem {
-                    path: format!("{dir_path}{sep}{name}"),
+                    path: join_display(&dir_path, &name),
                     bytes: r.get(2)?,
                     files: None,
                     mtime: Some(r.get(3)?),
