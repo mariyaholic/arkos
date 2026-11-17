@@ -49,11 +49,17 @@ pub struct DiffReport {
 
 /// Validate that both snapshots exist, belong to the same volume, and reached `complete` state.
 pub fn validate_diff_pair(conn: &Connection, snap_a: i64, snap_b: i64) -> Result<String> {
-    let fetch = |id: i64| -> Result<(String, String)> {
+    let fetch = |id: i64| -> Result<(String, String, String)> {
         conn.query_row(
-            "SELECT volume, state FROM arkos_snapshots WHERE id = ?1",
+            "SELECT volume, state, root FROM arkos_snapshots WHERE id = ?1",
             [id],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            },
         )
         .map_err(|e| match e {
             rusqlite::Error::QueryReturnedNoRows => {
@@ -63,8 +69,8 @@ pub fn validate_diff_pair(conn: &Connection, snap_a: i64, snap_b: i64) -> Result
         })
     };
 
-    let (vol_a, state_a) = fetch(snap_a)?;
-    let (vol_b, state_b) = fetch(snap_b)?;
+    let (vol_a, state_a, root_a) = fetch(snap_a)?;
+    let (vol_b, state_b, root_b) = fetch(snap_b)?;
     if state_a != "complete" {
         return Err(Error::Input(format!(
             "snapshot {snap_a} is '{state_a}' and cannot be diffed"
@@ -78,6 +84,11 @@ pub fn validate_diff_pair(conn: &Connection, snap_a: i64, snap_b: i64) -> Result
     if vol_a != vol_b {
         return Err(Error::Input(format!(
             "snapshots {snap_a} ({vol_a}) and {snap_b} ({vol_b}) belong to different volumes"
+        )));
+    }
+    if root_a != root_b {
+        return Err(Error::Refused(format!(
+            "snapshots {snap_a} (root {root_a}) and {snap_b} (root {root_b}) have different roots"
         )));
     }
     Ok(vol_a)
@@ -110,6 +121,18 @@ impl Change {
 /// Directories and files share one ranking by absolute delta (ties by path). `min_size` filters
 /// before the cut, and `dirs` and `files` in the report hold the entries that survived it.
 pub fn diff_snapshots(
+    conn: &Connection,
+    snap_a: i64,
+    snap_b: i64,
+    min_size: i64,
+    top: usize,
+) -> Result<DiffReport> {
+    crate::db::read_tx(conn, || {
+        diff_snapshots_inner(conn, snap_a, snap_b, min_size, top)
+    })
+}
+
+fn diff_snapshots_inner(
     conn: &Connection,
     snap_a: i64,
     snap_b: i64,

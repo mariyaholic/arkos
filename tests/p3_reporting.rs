@@ -49,7 +49,7 @@ fn retention_keeps_n_per_volume_and_root() {
 }
 
 #[test]
-fn failed_and_abandoned_rows_go_only_when_older_than_the_kept_set() {
+fn failed_and_abandoned_rows_are_always_candidates() {
     let env = Env::new("retfail");
     let c = &env.conn;
     let old_failed = insert(c, "C:", "C:\\", "failed", 10);
@@ -57,7 +57,7 @@ fn failed_and_abandoned_rows_go_only_when_older_than_the_kept_set() {
     let _c1 = insert(c, "C:", "C:\\", "complete", 20);
     let _c2 = insert(c, "C:", "C:\\", "complete", 30);
     let new_failed = insert(c, "C:", "C:\\", "failed", 40);
-    // A different root with a single old failure and no completed snapshot: nothing to compare.
+    // A different root with a single failure and no completed snapshot is a candidate too.
     let lone_failed = insert(c, "C:", "C:\\Other", "failed", 5);
 
     let ids: Vec<i64> = plan_prune(c, None, 2)
@@ -67,9 +67,9 @@ fn failed_and_abandoned_rows_go_only_when_older_than_the_kept_set() {
         .collect();
     assert!(ids.contains(&old_failed));
     assert!(ids.contains(&old_abandoned));
-    assert!(!ids.contains(&new_failed));
-    assert!(!ids.contains(&lone_failed));
-    assert_eq!(ids.len(), 2);
+    assert!(ids.contains(&new_failed));
+    assert!(ids.contains(&lone_failed));
+    assert_eq!(ids.len(), 4);
 }
 
 #[test]

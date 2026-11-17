@@ -33,6 +33,16 @@ pub fn query_top(
     by: TopBy,
     limit: usize,
 ) -> Result<Vec<TopItem>> {
+    crate::db::read_tx(conn, || query_top_inner(conn, snapshot_id, dirs, by, limit))
+}
+
+fn query_top_inner(
+    conn: &Connection,
+    snapshot_id: i64,
+    dirs: bool,
+    by: TopBy,
+    limit: usize,
+) -> Result<Vec<TopItem>> {
     let state: String = conn
         .query_row(
             "SELECT state FROM arkos_snapshots WHERE id = ?1",

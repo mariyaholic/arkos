@@ -106,6 +106,34 @@ pub fn status_probe_exit(conn: &Connection) -> Result<Exit> {
             |r| r.get(0),
         )
         .map_err(map_db_err)?;
+    probe_after_running(conn, running)
+}
+
+/// Like [`status_probe_exit`], for a read-only ledger that was not swept: a `running` row counts
+/// only when its volume lock is held (or, if the lock cannot be probed, it is under 24 hours old).
+pub fn status_probe_exit_with_locks(
+    conn: &Connection,
+    locks_dir: &std::path::Path,
+) -> Result<Exit> {
+    let now = chrono::Utc::now().timestamp();
+    let mut stmt = conn
+        .prepare("SELECT volume, started_at FROM arkos_snapshots WHERE state = 'running'")
+        .map_err(map_db_err)?;
+    let rows: Vec<(String, i64)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .map_err(map_db_err)?
+        .collect::<std::result::Result<_, _>>()
+        .map_err(map_db_err)?;
+    let running = rows.iter().any(|(volume, started_at)| {
+        match crate::lock::VolumeLock::is_free(locks_dir, volume) {
+            Ok(free) => !free,
+            Err(_) => *started_at >= now - 24 * 3600,
+        }
+    });
+    probe_after_running(conn, running)
+}
+
+fn probe_after_running(conn: &Connection, running: bool) -> Result<Exit> {
     if running {
         return Ok(Exit::Busy);
     }

@@ -14,6 +14,8 @@ pub struct Reporter {
     interval: Duration,
     last: Option<Instant>,
     printed: bool,
+    /// Width of the line on screen, so the next line or the clear can overwrite all of it.
+    width: usize,
 }
 
 impl Reporter {
@@ -24,6 +26,7 @@ impl Reporter {
             interval: INTERVAL,
             last: None,
             printed: false,
+            width: 0,
         }
     }
 
@@ -43,6 +46,7 @@ impl Reporter {
             interval,
             last: None,
             printed: false,
+            width: 0,
         }
     }
 
@@ -58,14 +62,22 @@ impl Reporter {
             }
         }
         self.last = Some(now);
-        let line = format!(
+        let mut line = format!(
             "scanned {files} files, {dirs} dirs, {}",
             crate::fmt::format_size(bytes.min(i64::MAX as u64) as i64)
         );
+        let shown = line.chars().count();
+        // Pad with spaces over what a longer previous line left behind; no escape sequences, so
+        // consoles without virtual terminal processing draw it the same way.
+        if shown < self.width {
+            line.push_str(&" ".repeat(self.width - shown));
+        }
+        let out = format!("\r{line}");
         if let Some(sink) = self.sink.as_mut() {
-            let _ = write!(sink, "\r{line}\x1b[K");
+            let _ = sink.write_all(out.as_bytes());
             let _ = sink.flush();
             self.printed = true;
+            self.width = self.width.max(shown);
         }
     }
 
@@ -75,9 +87,11 @@ impl Reporter {
             return;
         }
         if let Some(sink) = self.sink.as_mut() {
-            let _ = write!(sink, "\r\x1b[K");
+            let out = format!("\r{}\r", " ".repeat(self.width));
+            let _ = sink.write_all(out.as_bytes());
             let _ = sink.flush();
         }
+        self.width = 0;
         self.printed = false;
     }
 }
@@ -128,6 +142,10 @@ mod tests {
         r.tick(2, 1, 0);
         assert_eq!(text(&buf).matches("scanned").count(), 2);
         r.finish();
-        assert!(text(&buf).ends_with("\r\x1b[K"));
+        let out = text(&buf);
+        assert!(out.ends_with('\r'));
+        assert!(!out.contains('\x1b'));
+        let clear = out.rsplit("\r").nth(1).unwrap();
+        assert!(clear.len() >= "scanned 2 files, 1 dirs, 0 B".len() && clear.trim().is_empty());
     }
 }

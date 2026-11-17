@@ -137,18 +137,33 @@ pub fn run_scan_with_progress(
     let target = resolve_target(volume_arg, subpath)?;
     let _lock = VolumeLock::acquire(&paths.locks, &target.volume, config.busy_timeout_ms)?;
 
-    let already_running: bool = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM arkos_snapshots WHERE volume = ?1 AND state = 'running')",
-            [&target.volume],
-            |r| r.get(0),
+    // Holding the volume lock proves no live scan owns this volume, so any `running` row for it
+    // belongs to a dead scan (for example one that died after this process swept at open).
+    let dead: Vec<i64> = {
+        let mut stmt = conn
+            .prepare("SELECT id FROM arkos_snapshots WHERE volume = ?1 AND state = 'running'")
+            .map_err(map_db_err)?;
+        let ids = stmt
+            .query_map([&target.volume], |r| r.get(0))
+            .map_err(map_db_err)?
+            .collect::<std::result::Result<Vec<i64>, _>>()
+            .map_err(map_db_err)?;
+        ids
+    };
+    for id in dead {
+        conn.execute(
+            "UPDATE arkos_snapshots SET state = 'abandoned', finished_at = ?1
+             WHERE id = ?2 AND state = 'running'",
+            params![chrono::Utc::now().timestamp(), id],
         )
         .map_err(map_db_err)?;
-    if already_running {
-        return Err(Error::Refused(format!(
-            "another scan is already running for volume {}",
-            target.volume
-        )));
+        logger.event(
+            "abandoned_dead_scan",
+            &format!(
+                "snapshot={id} volume={} found running under the volume lock",
+                target.volume
+            ),
+        );
     }
 
     let resolved_mode = mode.as_resolved(&target.root)?;
@@ -189,7 +204,14 @@ pub fn run_scan_with_progress(
 
     let scan_t0 = Instant::now();
     let scan_res = match resolved_mode {
-        "mft" => mft::mft_into_snapshot(conn, snapshot_id, &target.root, filter, progress),
+        "mft" => mft::mft_into_snapshot(
+            conn,
+            snapshot_id,
+            &target.root,
+            filter,
+            progress,
+            mode == ScanMode::Mft,
+        ),
         _ => walk::walk_into_snapshot(conn, snapshot_id, &target.root, filter, progress).map(
             |stats| ScanOutcome {
                 stats,
@@ -241,7 +263,7 @@ pub fn run_scan_with_progress(
         "UPDATE arkos_snapshots
          SET state = 'complete', finished_at = ?1, files = ?2, dirs = ?3, bytes = ?4,
              denied = ?5, skipped = ?6, scan_ms = ?7, mode = ?8
-         WHERE id = ?9",
+         WHERE id = ?9 AND state = 'running'",
         params![
             finished_at,
             stats.files as i64,
@@ -254,11 +276,23 @@ pub fn run_scan_with_progress(
             snapshot_id,
         ],
     );
-    if let Err(e) = completed {
-        let e = map_db_err(e);
-        fail_snapshot(conn, snapshot_id, scan_ms);
-        logger.event("scan_failed", &format!("snapshot={snapshot_id} err={e}"));
-        return Err(e);
+    match completed {
+        Ok(1) => {}
+        Ok(_) => {
+            // Another process moved the row out of `running` (a sweep, then maybe a prune). The
+            // row is not ours to rewrite or clean up.
+            let e = Error::Refused(format!(
+                "snapshot {snapshot_id} left the running state during the scan"
+            ));
+            logger.event("scan_failed", &format!("snapshot={snapshot_id} err={e}"));
+            return Err(e);
+        }
+        Err(e) => {
+            let e = map_db_err(e);
+            fail_snapshot(conn, snapshot_id, scan_ms);
+            logger.event("scan_failed", &format!("snapshot={snapshot_id} err={e}"));
+            return Err(e);
+        }
     }
 
     let warning = if stats.denied > 0 {

@@ -102,6 +102,12 @@ pub fn relative(path: &str, root: &str) -> String {
 
 /// Render a static HTML + SVG report for `snapshot_id` up to `max_depth`.
 pub fn render_tree_html(conn: &Connection, snapshot_id: i64, max_depth: i32) -> Result<String> {
+    crate::db::read_tx(conn, || {
+        render_tree_html_inner(conn, snapshot_id, max_depth)
+    })
+}
+
+fn render_tree_html_inner(conn: &Connection, snapshot_id: i64, max_depth: i32) -> Result<String> {
     let (volume, root, total_bytes, denied): (String, String, i64, i64) = conn
         .query_row(
             "SELECT volume, root, bytes, denied FROM arkos_snapshots WHERE id = ?1 AND state = 'complete'",

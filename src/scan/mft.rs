@@ -67,14 +67,21 @@ pub fn volume_root_letter(root: &Path) -> Option<char> {
 /// the volume cannot be opened, or when the directory map outgrows its limit, the walk runs
 /// instead and the outcome is `walk` with a note for the log. The snapshot records the mode that
 /// ran, so `walk` here is the correct and complete answer, only slower.
+///
+/// With `explicit` set (`--mode mft`) the fallbacks for an unopenable volume and for too many
+/// directories become `Error::Unsupported`; only `--mode auto` falls back to the walk there. A
+/// subtree root still walks, since USN enumeration cannot be scoped to a folder.
 pub fn mft_into_snapshot(
     conn: &mut Connection,
     snapshot_id: i64,
     root: &Path,
     filter: ScanFilter<'_>,
     progress: &mut Reporter,
+    explicit: bool,
 ) -> Result<ScanOutcome> {
     ensure_mft_ready(root)?;
+    #[cfg(not(all(windows, feature = "mft")))]
+    let _ = explicit;
     #[cfg(all(windows, feature = "mft"))]
     let note: Option<String> = {
         use crate::scan::usn::{scan_with_source, UsnScan, DIR_LIMIT};
@@ -100,10 +107,20 @@ pub fn mft_into_snapshot(
                                     note: None,
                                 })
                             }
+                            UsnScan::TooManyDirs if explicit => {
+                                return Err(Error::Unsupported(format!(
+                                    "mft-slow: more than {DIR_LIMIT} directories; use --mode auto to walk instead"
+                                )))
+                            }
                             UsnScan::TooManyDirs => Some(format!(
                                 "mft-slow: more than {DIR_LIMIT} directories; walked instead"
                             )),
                         }
+                    }
+                    Err(e) if explicit => {
+                        return Err(Error::Unsupported(format!(
+                            "mft-unavailable: cannot open the volume ({e}); use --mode auto to walk instead"
+                        )))
                     }
                     Err(e) => Some(format!("mft-unavailable: {e}; walked instead")),
                 }

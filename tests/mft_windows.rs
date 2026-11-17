@@ -104,6 +104,7 @@ fn walk_matches_mft_on_the_same_tree() {
         Path::new(&volume_root),
         ScanFilter::default(),
         &mut arkos::progress::Reporter::off(),
+        false,
     )
     .unwrap();
     assert_eq!(

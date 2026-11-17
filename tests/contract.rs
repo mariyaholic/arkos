@@ -111,7 +111,7 @@ fn duplicut_0002_does_not_touch_arkos_tables() {
 }
 
 #[test]
-fn lock_wait_times_out_as_6_and_second_scan_is_4() {
+fn lock_wait_times_out_as_6_and_a_dead_running_row_is_abandoned_by_the_next_scan() {
     let root = temp_dir("lock");
     let paths = Paths::from_home(root.join("home"));
     paths.ensure_dirs().unwrap();
@@ -140,7 +140,8 @@ fn lock_wait_times_out_as_6_and_second_scan_is_4() {
 
     let cfg = Config::default();
     let log = Logger::new(&paths.logs);
-    let scan_err = run_scan(
+    // Nobody holds the lock, so the running row is dead: the scan abandons it and proceeds (SM-1).
+    let report = run_scan(
         &mut conn,
         &paths,
         &cfg,
@@ -151,8 +152,14 @@ fn lock_wait_times_out_as_6_and_second_scan_is_4() {
         ScanMode::Walk,
         &[],
     )
-    .unwrap_err();
-    assert_eq!(scan_err.exit(), Exit::Refused);
+    .unwrap();
+    let old_state: String = conn
+        .query_row("SELECT state FROM arkos_snapshots WHERE id = 1", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(old_state, "abandoned");
+    assert_ne!(report.snapshot_id, 1);
     let _ = std::fs::remove_dir_all(&root);
 }
 

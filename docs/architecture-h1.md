@@ -114,7 +114,7 @@ The name must be longer than the suffix plus its dot, so a file named `.tar.gz` 
 
 **18. Retention per root.** `plan_prune` partitions completed snapshots by `(volume, root)` and keeps
 the newest N in each partition. `running` snapshots are never candidates; `failed` and `abandoned`
-rows older than the newest N in their partition are candidates.
+rows are always candidates, whatever the number of complete snapshots in their partition.
 
 ## P4: Treemap
 

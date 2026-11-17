@@ -80,7 +80,7 @@ struct Hook {
 
 impl Write for Hook {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let is_clear = buf == b"\r\x1b[K";
+        let is_clear = buf.len() >= 2 && buf.starts_with(b"\r") && buf.ends_with(b"\r");
         if is_clear != self.on_tick {
             (self.hook)();
         }
@@ -251,7 +251,6 @@ fn a_second_scan_of_a_running_volume_is_refused_and_leaves_the_first_row_alone()
 // ---------------------------------------------------------------------------------------------
 
 #[test]
-#[ignore = "defect SM-1: run_scan refuses on a dead running row it found after taking the volume lock"]
 fn sm1_scan_abandons_a_dead_running_row_it_finds_under_its_own_lock() {
     let mut env = Env::new("sm1");
     let tree = small_tree(&env);
@@ -273,7 +272,6 @@ fn sm1_scan_abandons_a_dead_running_row_it_finds_under_its_own_lock() {
 }
 
 #[test]
-#[ignore = "defect SM-2: completion UPDATE ignores rows_affected, so a scan reports success for a snapshot that no longer exists"]
 fn sm2_scan_does_not_report_success_for_a_snapshot_that_vanished() {
     let mut env = Env::new("sm2");
     let tree = small_tree(&env);
@@ -293,25 +291,12 @@ fn sm2_scan_does_not_report_success_for_a_snapshot_that_vanished() {
     });
     let res = scan_with_hook(&mut env, &tree.to_string_lossy(), false, hook);
     assert!(*fired.lock().unwrap(), "hook did not run");
-    if let Ok(rep) = res {
-        let n: i64 = env
-            .conn
-            .query_row(
-                "SELECT count(*) FROM arkos_snapshots WHERE id = ?1 AND state = 'complete'",
-                [rep.snapshot_id],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            n, 1,
-            "reported snapshot {} is not in the ledger",
-            rep.snapshot_id
-        );
-    }
+    let err = res.expect_err("the snapshot left the running state, so the scan did not succeed");
+    assert_eq!(err.exit(), arkos::exit::Exit::Refused);
+    assert!(err.to_string().contains("left the running state"), "{err}");
 }
 
 #[test]
-#[ignore = "defect SM-3: read verbs open writable, so BEGIN IMMEDIATE blocks them behind a scan's write transaction"]
 fn sm3_a_read_verb_can_open_the_ledger_while_a_scan_is_writing() {
     let mut env = Env::new("sm3");
     let tree = small_tree(&env);
@@ -320,10 +305,11 @@ fn sm3_a_read_verb_can_open_the_ledger_while_a_scan_is_writing() {
     let out2 = outcome.clone();
     let hook = Box::new(move || {
         // Runs at the first progress tick, with the scan's batch transaction open.
-        let r = db::open_and_migrate(&db_path, &locks, 150);
-        *out2.lock().unwrap() = Some(match r {
-            Ok(_) => "ok".to_owned(),
-            Err(e) => e.to_string(),
+        let read = db::open_read(&db_path, 150).map(|c| c.is_some());
+        let write = db::open_and_migrate(&db_path, &locks, 150).map(|_| ());
+        *out2.lock().unwrap() = Some(match (read, write) {
+            (Ok(true), Ok(())) => "ok".to_owned(),
+            (r, w) => format!("read {r:?}, write {:?}", w.map_err(|e| e.to_string())),
         });
     });
     scan_with_hook(&mut env, &tree.to_string_lossy(), true, hook).unwrap();
@@ -348,7 +334,6 @@ fn sm4_unlinking_the_lock_file_does_not_admit_a_second_holder() {
 
 #[cfg(unix)]
 #[test]
-#[ignore = "defect SM-5: the lock key upper-cases the volume, so /data/A and /data/a share one lock on a case-sensitive filesystem"]
 fn sm5_case_distinct_directories_have_distinct_locks() {
     let env = Env::new("sm5");
     let a = VolumeLock::acquire(&env.paths.locks, "dir:/data/A", 200).unwrap();
@@ -358,7 +343,6 @@ fn sm5_case_distinct_directories_have_distinct_locks() {
 }
 
 #[test]
-#[ignore = "defect SM-6a: a trailing separator makes a second volume key for the same directory"]
 fn sm6a_dir_volume_key_ignores_a_trailing_separator() {
     let d = temp_dir("sm6a");
     let plain = d.to_string_lossy().into_owned();
@@ -370,7 +354,6 @@ fn sm6a_dir_volume_key_ignores_a_trailing_separator() {
 }
 
 #[test]
-#[ignore = "defect SM-6b: a relative --volume is stored as a relative key, so it names a different tree per working directory"]
 fn sm6b_dir_volume_key_is_absolute() {
     // `tests` exists relative to the package root, which is the working directory of this test.
     let t = resolve_target("tests", None).unwrap();
@@ -379,7 +362,6 @@ fn sm6b_dir_volume_key_is_absolute() {
 }
 
 #[test]
-#[ignore = "defect SM-7: diff compares the volume but not the root, so a subtree snapshot diffs against a full one"]
 fn sm7_diff_refuses_snapshots_of_different_roots() {
     let mut env = Env::new("sm7");
     let tree = small_tree(&env);
@@ -390,7 +372,6 @@ fn sm7_diff_refuses_snapshots_of_different_roots() {
 }
 
 #[test]
-#[ignore = "defect SM-8: list and prune --volume match the stored key, not the value scan accepted"]
 fn sm8_list_volume_accepts_the_same_spelling_as_scan() {
     let home = temp_dir("sm8-home");
     let tree = temp_dir("sm8-tree");
@@ -414,7 +395,6 @@ fn sm8_list_volume_accepts_the_same_spelling_as_scan() {
 }
 
 #[test]
-#[ignore = "defect SM-9: failed and abandoned rows are never prune candidates in a group with fewer than `keep` complete snapshots"]
 fn sm9_prune_reclaims_abandoned_rows_of_a_root_that_never_completed() {
     let env = Env::new("sm9");
     let old = insert_snap(&env.conn, "dir:/never", "/never", "abandoned", 100);
@@ -427,16 +407,13 @@ fn sm9_prune_reclaims_abandoned_rows_of_a_root_that_never_completed() {
         )
         .unwrap();
     let plan = retention::plan_prune(&env.conn, None, 1).unwrap();
-    let ids: Vec<i64> = plan.iter().map(|c| c.id).collect();
-    assert_eq!(
-        ids,
-        vec![old],
-        "kept {newer}, but {old} and its rows stay forever"
-    );
+    let mut ids: Vec<i64> = plan.iter().map(|c| c.id).collect();
+    ids.sort();
+    // Decision: failed and abandoned rows are always candidates, whatever the complete count.
+    assert_eq!(ids, vec![old, newer]);
 }
 
 #[test]
-#[ignore = "defect SM-10: opening a ledger that is not yet in WAL mode fails at once with Busy instead of waiting"]
 fn sm10_open_waits_for_a_writer_during_the_wal_switch() {
     let d = temp_dir("sm10");
     let p = d.join("shimatsu.sqlite");
@@ -454,8 +431,7 @@ fn sm10_open_waits_for_a_writer_during_the_wal_switch() {
 }
 
 #[test]
-#[ignore = "defect SM-11: a ledger with the arkos tables but user_version 0 cannot be opened or repaired"]
-fn sm11_open_recovers_a_ledger_whose_user_version_was_lost() {
+fn sm11_open_refuses_a_ledger_whose_user_version_was_lost() {
     let d = temp_dir("sm11");
     let p = d.join("shimatsu.sqlite");
     {
@@ -463,8 +439,16 @@ fn sm11_open_recovers_a_ledger_whose_user_version_was_lost() {
         let c = Connection::open(&p).unwrap();
         c.execute_batch(include_str!("../src/db/0001.sql")).unwrap();
     }
-    let r = db::open_and_migrate(&p, &d.join("locks"), 500);
-    assert!(r.is_ok(), "{:?}", r.err().map(|e| e.to_string()));
+    // Decision: no guessed recovery; refuse with exit 4 and a stable reason.
+    let e = db::open_and_migrate(&p, &d.join("locks"), 500).unwrap_err();
+    assert_eq!(e.exit(), arkos::exit::Exit::Refused);
+    assert!(
+        e.to_string()
+            .contains("ledger.inconsistent: tables present but user_version is 0"),
+        "{e}"
+    );
+    let e = db::open_read(&p, 500).unwrap_err();
+    assert_eq!(e.exit(), arkos::exit::Exit::Refused);
     let _ = std::fs::remove_dir_all(&d);
 }
 
@@ -481,7 +465,6 @@ impl Write for Shared {
 }
 
 #[test]
-#[ignore = "defect SM-12: the walk ticks before a directory's files are counted, so a one-folder scan reports 0 files"]
 fn sm12_progress_reports_the_files_of_the_last_directory() {
     let mut env = Env::new("sm12");
     let tree = env.root.join("flat");
@@ -508,4 +491,114 @@ fn sm12_progress_reports_the_files_of_the_last_directory() {
     .unwrap();
     let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
     assert!(text.contains("scanned 50 files"), "{text:?}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Behaviour added with the fixes.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn s1_read_tx_keeps_one_snapshot_while_another_connection_prunes() {
+    let mut env = Env::new("s1");
+    let tree = small_tree(&env);
+    let id = env.scan(&tree).snapshot_id;
+    let reader = db::open_read(&env.paths.db, 1000).unwrap().unwrap();
+    let count = |c: &Connection| -> i64 {
+        c.query_row(
+            "SELECT count(*) FROM arkos_dirs WHERE snapshot_id = ?1",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    let (before, after) = db::read_tx(&reader, || {
+        let before = count(&reader);
+        // Another connection prunes the snapshot between the two reads.
+        retention::prune_completed(&env.conn, None, 0).unwrap();
+        Ok((before, count(&reader)))
+    })
+    .unwrap();
+    assert!(before > 0);
+    assert_eq!(before, after);
+    assert_eq!(
+        count(&reader),
+        0,
+        "a read after the transaction sees the prune"
+    );
+    assert!(reader.is_autocommit());
+}
+
+#[test]
+fn lock_keys_fold_case_for_drive_letters_only() {
+    let d = temp_dir("lockkey");
+    use arkos::lock::lock_path_for;
+    assert_eq!(lock_path_for(&d, "c:"), lock_path_for(&d, "C:"));
+    if !cfg!(windows) {
+        assert_ne!(lock_path_for(&d, "dir:/x/A"), lock_path_for(&d, "dir:/x/a"));
+    }
+}
+
+#[test]
+fn read_verbs_treat_a_missing_ledger_as_empty_or_exit_3() {
+    let home = temp_dir("noledger");
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_arkos"))
+            .env("ARKOS_HOME", &home)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let list = run(&["list", "--json"]);
+    assert!(list.status.success());
+    assert_eq!(String::from_utf8_lossy(&list.stdout).trim(), "[]");
+    assert!(run(&["status", "--probe"]).status.success());
+    assert_eq!(run(&["top", "--snapshot", "1"]).status.code(), Some(3));
+    assert!(
+        !home.join("shimatsu.sqlite").exists(),
+        "a read verb must not create the ledger"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn volume_key_accepts_scan_spelling_stored_key_and_missing_dirs() {
+    use arkos::volumes::volume_key;
+    let d = temp_dir("vkey");
+    let plain = d.to_string_lossy().into_owned();
+    let key = volume_key(&plain).unwrap();
+    assert_eq!(volume_key(&format!("{plain}/")).unwrap(), key);
+    assert_eq!(volume_key(&key).unwrap(), key);
+    assert_eq!(volume_key("c:").unwrap(), "C:");
+    assert_eq!(volume_key("C:\\").unwrap(), "C:");
+    let gone = d.join("gone");
+    assert_eq!(
+        volume_key(&gone.to_string_lossy()).unwrap(),
+        format!("dir:{}", gone.display())
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn a_scan_that_abandons_a_dead_row_stamps_finished_at() {
+    let mut env = Env::new("sm1-finished");
+    let tree = small_tree(&env);
+    let dead = insert_snap(
+        &env.conn,
+        &format!("dir:{}", tree.display()),
+        "r",
+        "running",
+        now(),
+    );
+    scan_walk(&mut env, &tree.to_string_lossy(), None).unwrap();
+    let finished: Option<i64> = env
+        .conn
+        .query_row(
+            "SELECT finished_at FROM arkos_snapshots WHERE id = ?1",
+            [dead],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(finished.is_some());
+    let log = std::fs::read_to_string(env.paths.logs.join("arkos.log")).unwrap();
+    assert!(log.contains("abandoned_dead_scan"), "{log}");
 }

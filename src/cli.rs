@@ -7,11 +7,12 @@ use crate::exit::{Error, Exit, Result};
 use crate::fmt::{format_delta, format_size};
 use crate::logging::Logger;
 use crate::paths::{PathEnvironment, Paths};
-use crate::probe::{build_probe_doc, status_probe_exit};
+use crate::probe::{build_probe_doc, status_probe_exit_with_locks};
 use crate::progress::Reporter;
 use crate::scan::{run_scan_with_progress, ScanMode};
 use crate::top::{query_top, TopBy};
 use crate::tree::write_tree_file;
+use crate::volumes::volume_key;
 use clap::{Parser, Subcommand};
 use rusqlite::params;
 use serde::Serialize;
@@ -246,8 +247,11 @@ fn try_run() -> Result<Exit> {
             limit,
             json,
         } => {
-            let conn = db::open_and_migrate(&paths.db, &paths.locks, config.busy_timeout_ms)?;
-            let rows = list_snapshots(&conn, volume.as_deref(), limit)?;
+            let volume = volume.as_deref().map(volume_key).transpose()?;
+            let rows = match db::open_read(&paths.db, config.busy_timeout_ms)? {
+                Some(conn) => list_snapshots(&conn, volume.as_deref(), limit)?,
+                None => Vec::new(),
+            };
             if json {
                 println!(
                     "{}",
@@ -286,7 +290,7 @@ fn try_run() -> Result<Exit> {
                     )));
                 }
             }
-            let conn = db::open_and_migrate(&paths.db, &paths.locks, config.busy_timeout_ms)?;
+            let conn = require_ledger(&paths, &config)?;
             let report = diff_snapshots(&conn, a, b, min_size, top)?;
             let text =
                 serde_json::to_string_pretty(&report).map_err(|e| Error::Cli(e.to_string()))?;
@@ -328,7 +332,7 @@ fn try_run() -> Result<Exit> {
             limit,
             json,
         } => {
-            let conn = db::open_and_migrate(&paths.db, &paths.locks, config.busy_timeout_ms)?;
+            let conn = require_ledger(&paths, &config)?;
             let items = query_top(&conn, snapshot, dirs, by, limit)?;
             if json {
                 println!(
@@ -347,7 +351,7 @@ fn try_run() -> Result<Exit> {
             out,
             depth,
         } => {
-            let conn = db::open_and_migrate(&paths.db, &paths.locks, config.busy_timeout_ms)?;
+            let conn = require_ledger(&paths, &config)?;
             write_tree_file(&conn, snapshot, &out, depth)?;
             println!("wrote treemap {}", out.display());
             Ok(Exit::Ok)
@@ -363,6 +367,7 @@ fn try_run() -> Result<Exit> {
             if !(1..=12).contains(&keep) {
                 return Err(Error::Cli("--keep must be between 1 and 12".into()));
             }
+            let volume = volume.as_deref().map(volume_key).transpose()?;
             let conn = db::open_and_migrate(&paths.db, &paths.locks, config.busy_timeout_ms)?;
             if yes {
                 let deleted = db::retention::prune_completed(&conn, volume.as_deref(), keep)?;
@@ -406,9 +411,13 @@ fn try_run() -> Result<Exit> {
             }
         }
         Command::Status { probe, json } => {
-            let conn = db::open_and_migrate(&paths.db, &paths.locks, config.busy_timeout_ms)?;
-            let code = status_probe_exit(&conn)?;
-            let info = db::info(&conn)?;
+            let (code, info) = match db::open_read(&paths.db, config.busy_timeout_ms)? {
+                Some(conn) => (
+                    status_probe_exit_with_locks(&conn, &paths.locks)?,
+                    db::info(&conn)?,
+                ),
+                None => (Exit::Ok, db::info(&empty_ledger()?)?),
+            };
             if probe && !json {
                 println!("probe={}", code.code());
             } else if json {
@@ -438,8 +447,10 @@ fn try_run() -> Result<Exit> {
         }
         Command::Db { action } => match action {
             DbAction::Info { json } => {
-                let conn = db::open_and_migrate(&paths.db, &paths.locks, config.busy_timeout_ms)?;
-                let info = db::info(&conn)?;
+                let info = match db::open_read(&paths.db, config.busy_timeout_ms)? {
+                    Some(conn) => db::info(&conn)?,
+                    None => db::info(&empty_ledger()?)?,
+                };
                 if json {
                     println!(
                         "{}",
@@ -473,6 +484,21 @@ fn try_run() -> Result<Exit> {
         },
         Command::Paths { .. } | Command::Probe => unreachable!(),
     }
+}
+
+/// An in-memory ledger standing in for a ledger file that does not exist yet.
+fn empty_ledger() -> Result<rusqlite::Connection> {
+    rusqlite::Connection::open_in_memory().map_err(map_db_err)
+}
+
+/// Open the ledger read-only for a verb that needs a snapshot to exist.
+fn require_ledger(paths: &Paths, config: &Config) -> Result<rusqlite::Connection> {
+    db::open_read(&paths.db, config.busy_timeout_ms)?.ok_or_else(|| {
+        Error::Input(format!(
+            "no ledger at {}; run `arkos scan` first",
+            paths.db.display()
+        ))
+    })
 }
 
 fn list_snapshots(

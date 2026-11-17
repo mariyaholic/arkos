@@ -9,6 +9,54 @@ point at that tree. Reproducing tests live in `tests/state_machines.rs`; each de
 Reading guide: a "guard" is a condition the code checks before a transition. "Unguarded" means the
 code performs the transition without checking the state it assumes.
 
+## Status after the fixes
+
+The sections below describe the machines as found in Phase A. Phase B fixed these findings, and
+their tests in `tests/state_machines.rs` now run without `#[ignore]`: SM-1, SM-2, SM-3, SM-5,
+SM-6, SM-7, SM-8, SM-9, SM-10, SM-11, SM-12, S-1, S-3 and S-8. Where a table below still shows the
+old behaviour, the fix is:
+
+- SM-1: under its own volume lock a scan marks every `running` row for the volume `abandoned`
+  (`finished_at` set, `abandoned_dead_scan` logged) and proceeds.
+- SM-2: the completion UPDATE has `AND state = 'running'`; a row count other than 1 returns
+  `Refused` ("snapshot N left the running state during the scan") and no success is reported.
+- SM-3: `list`, `top`, `diff`, `tree`, `status` and `db info` use `db::open_read`, which never
+  migrates, sweeps, creates the file or takes the write lock. A missing ledger is an empty list or
+  status, and exit 3 for `top`, `diff` and `tree`. `migrate` checks `user_version` first and takes
+  `BEGIN IMMEDIATE` only when it has to migrate. `scan`, `prune`, `db migrate` and `db vacuum`
+  stay writable and sweep. Because the read verbs no longer sweep, `status --probe` counts a
+  `running` row only while its lock is held.
+- SM-5: lock keys fold case for drive letters and volume GUID paths, and for `dir:` keys only on
+  Windows.
+- SM-6 and SM-8: `volumes::volume_key` is the one place a volume argument becomes a key; `scan`,
+  `list --volume` and `prune --volume` all use it. Directory keys use the canonical absolute path.
+- SM-7: `diff` returns `Refused` naming both roots when they differ.
+- SM-9: `failed` and `abandoned` rows are always prune candidates; `running` never is.
+- SM-10: the WAL switch retries every 25 ms within the busy timeout.
+- SM-11: tables present with `user_version` 0 is `Refused` (exit 4), reason
+  `ledger.inconsistent: tables present but user_version is 0`.
+- SM-12: the walk ticks after a directory's files are counted.
+- S-1: `diff`, `top` and `tree` read inside one `BEGIN DEFERRED` transaction (`db::read_tx`). The
+  test builds its seam on `read_tx` itself, with a prune between two reads; `diff` has no hook of
+  its own.
+- S-3: the progress line is cleared with `\r`, space padding to the widest line printed, and `\r`.
+- S-8: `--mode mft` returns `Unsupported` (exit 5) when the volume cannot be opened or the
+  directory map passes the limit. Only `--mode auto` falls back to the walk. Windows only, so
+  unexecuted here.
+
+## Deferred
+
+| ID | Reason |
+|---|---|
+| SM-4 | Needs a deliberate unlink of the lock file; a fix needs an inode recheck loop after locking. Its test stays `#[ignore]`. |
+| S-2 | Predicted mode on failed and abandoned rows shows only on Windows and is cosmetic. |
+| S-4 | A race of microseconds with no deterministic seam; only matters with `busy_timeout_ms = 0`. |
+| S-5 | Needs `AUTOINCREMENT`, which is a schema change and schema 0001 is frozen. |
+| S-6 | The spec requires refusing a newer `user_version`. |
+| S-7 | Needs a long cascade delete; not deterministic in a test. |
+| S-9 | Cosmetic: abandoned `finished_at` is the sweep time. |
+| S-10 | Needs a hung process and a heartbeat design. |
+
 ## 1. Snapshot lifecycle (`arkos_snapshots.state`)
 
 The `state` column has a CHECK constraint for `running`, `complete`, `failed`, `abandoned`
@@ -274,7 +322,7 @@ consoles that have not enabled virtual terminal processing print that sequence l
 
 ## Defects reproduced by a failing test
 
-Run `cargo test --test state_machines -- --ignored`. All thirteen tests below fail today.
+Run `cargo test --test state_machines -- --ignored`. Thirteen tests failed when written; only SM-4 is still `#[ignore]` (see Deferred).
 
 | ID | Severity | Where | Summary | Test |
 |---|---|---|---|---|

@@ -113,8 +113,20 @@ impl Drop for VolumeLock {
 
 /// Compute the deterministic lock file path `volume-<hex12>.lock` for a volume identifier.
 pub fn lock_path_for(locks_dir: &Path, volume: &str) -> PathBuf {
-    let hex = fnv64_hex(&volume.to_ascii_uppercase());
+    let hex = fnv64_hex(&lock_key(volume));
     locks_dir.join(format!("volume-{}.lock", &hex[..12]))
+}
+
+/// Case-fold drive letters and volume GUID paths, which Windows treats as case-insensitive. A
+/// `dir:` key folds only on Windows; on Unix `/data/A` and `/data/a` are different directories.
+fn lock_key(volume: &str) -> String {
+    let is_drive = volume.len() == 2 && volume.ends_with(':');
+    let is_guid = volume.starts_with(r"\\?\Volume{");
+    if is_drive || is_guid || (cfg!(windows) && volume.starts_with("dir:")) {
+        volume.to_ascii_uppercase()
+    } else {
+        volume.to_owned()
+    }
 }
 
 fn fnv64_hex(input: &str) -> String {

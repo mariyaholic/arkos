@@ -94,10 +94,10 @@ pub struct PruneCandidate {
 /// List the snapshots a prune would delete.
 ///
 /// Snapshots are grouped by `(volume, root)`, so a subtree scan never pushes out a full-volume
-/// snapshot. In each group the newest `keep` completed snapshots stay, older completed ones are
-/// candidates, and `failed` or `abandoned` rows older than the `keep`th newest completed one are
-/// candidates too. `running` snapshots are never candidates. [`prune_completed`] deletes exactly
-/// this list.
+/// snapshot. In each group the newest `keep` completed snapshots stay and older completed ones
+/// are candidates. `failed` and `abandoned` rows are always candidates, whatever the number of
+/// completed snapshots, because they cannot be diffed and an abandoned scan may hold partial
+/// rows. `running` snapshots are never candidates. [`prune_completed`] deletes exactly this list.
 pub fn plan_prune(
     conn: &Connection,
     volume_filter: Option<&str>,
@@ -141,22 +141,14 @@ pub fn plan_prune(
         let group = &all[start..end];
         let complete: Vec<&PruneCandidate> =
             group.iter().filter(|c| c.state == "complete").collect();
-        // The cut: rows ordered before the `keep`th newest completed snapshot are older than it.
-        let cut = if keep == 0 {
-            None
-        } else {
-            complete.get(keep - 1).map(|c| (c.started_at, c.id))
-        };
         for c in group {
             let drop_it = if c.state == "complete" {
                 complete
                     .iter()
                     .position(|x| x.id == c.id)
                     .is_some_and(|rank| rank >= keep)
-            } else if keep == 0 {
-                true
             } else {
-                cut.is_some_and(|cut| (c.started_at, c.id) < cut)
+                true
             };
             if drop_it {
                 out.push(c.clone());

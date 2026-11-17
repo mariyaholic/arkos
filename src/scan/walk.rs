@@ -445,7 +445,6 @@ fn consume_and_insert(
             token_to_id.insert(node.token, dir_id);
             dirs += 1;
             ops_in_tx += 1;
-            progress.tick(files, dirs, bytes);
 
             if !node.files.is_empty() {
                 let mut stmt = tx
@@ -462,6 +461,7 @@ fn consume_and_insert(
                     ops_in_tx += 1;
                 }
             }
+            progress.tick(files, dirs, bytes);
 
             if let Some(children) = pending.remove(&node.token) {
                 for ch in children.into_iter().rev() {
