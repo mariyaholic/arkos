@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Deterministic fixture tree generator.
 //!
 //! Shared by `examples/gen_tree.rs` and the integration tests. The same `(files, dirs, depth,
