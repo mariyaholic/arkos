@@ -15,4 +15,5 @@ pub mod rollup;
 pub mod scan;
 pub mod top;
 pub mod tree;
+pub mod treemap;
 pub mod volumes;
