@@ -1,5 +1,8 @@
 #![allow(dead_code)]
+
 //! Helpers shared by the integration tests.
+
+pub mod fixture;
 
 use arkos::config::Config;
 use arkos::db;

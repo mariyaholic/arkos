@@ -17,6 +17,9 @@ use std::time::UNIX_EPOCH;
 const WORKER_COUNT: usize = 3;
 const BATCH_COMMIT_ENTRIES: usize = 1_000;
 
+/// Most non-Unicode names kept for the scan log; the rest are only counted.
+const MAX_LOGGED_NAMES: usize = 50;
+
 /// Summary returned after streaming scan rows for a snapshot.
 #[derive(Debug, Default, Clone)]
 pub struct WalkStats {
@@ -25,6 +28,32 @@ pub struct WalkStats {
     pub bytes: u64,
     pub denied: u64,
     pub skipped: u64,
+    /// Lossy forms of entries skipped because their names are not valid Unicode (capped).
+    pub non_unicode: Vec<String>,
+}
+
+/// What the walk leaves out: name or path globs, and exact directories.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ScanFilter<'a> {
+    pub globs: &'a [String],
+    pub exact_dirs: &'a [PathBuf],
+}
+
+impl ScanFilter<'_> {
+    fn excludes_exact(&self, path: &Path) -> bool {
+        self.exact_dirs.iter().any(|p| same_path(p, path))
+    }
+}
+
+#[cfg(windows)]
+fn same_path(a: &Path, b: &Path) -> bool {
+    a.to_string_lossy()
+        .eq_ignore_ascii_case(&b.to_string_lossy())
+}
+
+#[cfg(not(windows))]
+fn same_path(a: &Path, b: &Path) -> bool {
+    a == b
 }
 
 #[derive(Debug)]
@@ -116,7 +145,7 @@ pub fn walk_into_snapshot(
     conn: &mut Connection,
     snapshot_id: i64,
     root: &Path,
-    excludes: &[String],
+    filter: ScanFilter<'_>,
     progress: &mut Reporter,
 ) -> Result<WalkStats> {
     let root_meta = fs::symlink_metadata(to_os_open_path(root)).map_err(|source| Error::Io {
@@ -141,6 +170,7 @@ pub fn walk_into_snapshot(
     let next_token = Arc::new(AtomicU64::new(2));
     let denied = Arc::new(AtomicU64::new(0));
     let skipped = Arc::new(AtomicU64::new(0));
+    let non_unicode = Arc::new(Mutex::new(Vec::<String>::new()));
     let (tx, rx) = mpsc::sync_channel::<WriterMsg>(64);
 
     let mut stats = WalkStats::default();
@@ -152,10 +182,11 @@ pub fn walk_into_snapshot(
             let nt = Arc::clone(&next_token);
             let den = Arc::clone(&denied);
             let skp = Arc::clone(&skipped);
+            let nu = Arc::clone(&non_unicode);
             let wtx = tx.clone();
             scope.spawn(move || {
                 while let Some(item) = q.pop() {
-                    process_dir(&item, excludes, &q, &nt, &den, &skp, &wtx);
+                    process_dir(&item, filter, &q, &nt, &den, &skp, &nu, &wtx);
                     q.finish_one();
                 }
             });
@@ -182,16 +213,20 @@ pub fn walk_into_snapshot(
 
     stats.denied = denied.load(Ordering::Acquire);
     stats.skipped = skipped.load(Ordering::Acquire);
+    stats.non_unicode = non_unicode.lock().expect("non-unicode list").clone();
+    stats.non_unicode.sort();
     Ok(stats)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process_dir(
     item: &WorkItem,
-    excludes: &[String],
+    filter: ScanFilter<'_>,
     queue: &WorkQueue,
     next_token: &AtomicU64,
     denied: &AtomicU64,
     skipped: &AtomicU64,
+    non_unicode: &Mutex<Vec<String>>,
     tx: &mpsc::SyncSender<WriterMsg>,
 ) {
     let open_path = to_os_open_path(&item.path);
@@ -237,11 +272,30 @@ fn process_dir(
                 continue;
             }
         };
-        let entry_name = entry.file_name().to_string_lossy().into_owned();
+        // A name that is not valid Unicode cannot be stored faithfully, and a lossy form could
+        // collide with a real name under the (snapshot_id, dir_id, name) key. Skip and count it.
+        let entry_name = match entry.file_name().into_string() {
+            Ok(name) => name,
+            Err(raw) => {
+                skipped.fetch_add(1, Ordering::Relaxed);
+                let mut names = non_unicode.lock().expect("non-unicode list");
+                if names.len() < MAX_LOGGED_NAMES {
+                    names.push(format!(
+                        "{}{}{}",
+                        normalize_display_path(&item.path),
+                        std::path::MAIN_SEPARATOR,
+                        raw.to_string_lossy()
+                    ));
+                }
+                continue;
+            }
+        };
         let child_path = item.path.join(&entry_name);
         let child_display = normalize_display_path(&child_path);
 
-        if matches_any_exclude(&entry_name, &child_display, excludes) {
+        if filter.excludes_exact(&child_path)
+            || matches_any_exclude(&entry_name, &child_display, filter.globs)
+        {
             skipped.fetch_add(1, Ordering::Relaxed);
             continue;
         }

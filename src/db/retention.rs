@@ -1,9 +1,11 @@
 //! Snapshot retention, abandoned-scan sweeper, and bounded incremental vacuum.
 
 use crate::db::map_db_err;
-use crate::exit::Result;
+use crate::exit::{Error, Result};
+use crate::lock::VolumeLock;
 use rusqlite::{params, Connection};
 use serde::Serialize;
+use std::path::Path;
 
 const STALE_RUNNING_AGE_SECS: i64 = 24 * 3600;
 const INCREMENTAL_VACUUM_THRESHOLD_BYTES: u64 = 32 * 1024 * 1024;
@@ -14,16 +16,18 @@ pub fn sweep_abandoned(conn: &Connection) -> Result<usize> {
     sweep_abandoned_at(conn, now)
 }
 
+fn has_snapshots_table(conn: &Connection) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='arkos_snapshots')",
+        [],
+        |r| r.get(0),
+    )
+    .map_err(map_db_err)
+}
+
 /// Testable variant of [`sweep_abandoned`] with explicit current timestamp.
 pub fn sweep_abandoned_at(conn: &Connection, now: i64) -> Result<usize> {
-    let exists: bool = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='arkos_snapshots')",
-            [],
-            |r| r.get(0),
-        )
-        .map_err(map_db_err)?;
-    if !exists {
+    if !has_snapshots_table(conn)? {
         return Ok(0);
     }
     let cutoff = now - STALE_RUNNING_AGE_SECS;
@@ -34,6 +38,49 @@ pub fn sweep_abandoned_at(conn: &Connection, now: i64) -> Result<usize> {
             params![now, cutoff],
         )
         .map_err(map_db_err)?;
+    Ok(changed)
+}
+
+/// Mark `running` snapshots `abandoned` when nothing holds their volume lock.
+///
+/// A scan holds its volume lock from before it inserts the `running` row until after it sets the
+/// final state, and the OS drops the lock when the process dies. So a `running` row whose lock
+/// can be taken without waiting belongs to a dead scan. When the lock directory cannot be used,
+/// the row falls back to the 24 hour rule.
+pub fn sweep_abandoned_with_locks(conn: &Connection, locks_dir: &Path, now: i64) -> Result<usize> {
+    if !has_snapshots_table(conn)? {
+        return Ok(0);
+    }
+    let mut stmt = conn
+        .prepare("SELECT id, volume, started_at FROM arkos_snapshots WHERE state = 'running'")
+        .map_err(map_db_err)?;
+    let running: Vec<(i64, String, i64)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .map_err(map_db_err)?
+        .collect::<std::result::Result<_, _>>()
+        .map_err(map_db_err)?;
+    drop(stmt);
+
+    let mut changed = 0usize;
+    for (id, volume, started_at) in running {
+        let dead = match VolumeLock::acquire(locks_dir, &volume, 0) {
+            Ok(lock) => {
+                drop(lock);
+                true
+            }
+            Err(Error::Busy(_)) => false,
+            Err(_) => started_at < now - STALE_RUNNING_AGE_SECS,
+        };
+        if dead {
+            changed += conn
+                .execute(
+                    "UPDATE arkos_snapshots SET state = 'abandoned', finished_at = ?1
+                     WHERE id = ?2 AND state = 'running'",
+                    params![now, id],
+                )
+                .map_err(map_db_err)?;
+        }
+    }
     Ok(changed)
 }
 

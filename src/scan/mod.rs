@@ -13,12 +13,12 @@ use crate::paths::Paths;
 use crate::progress::Reporter;
 use crate::rollup::rollup_snapshot;
 use crate::scan::paths::normalize_display_path;
-use crate::scan::walk::WalkStats;
+use crate::scan::walk::{ScanFilter, WalkStats};
 use crate::volumes::{is_elevated, is_ntfs, resolve_target};
 use clap::ValueEnum;
 use rusqlite::{params, Connection};
 use serde::Serialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 /// Requested scanner mode.
@@ -31,20 +31,37 @@ pub enum ScanMode {
 
 impl ScanMode {
     fn as_resolved(self, root: &Path) -> Result<&'static str> {
+        let built = cfg!(all(windows, feature = "mft"));
         match self {
-            Self::Walk => Ok("walk"),
-            Self::Mft => {
-                mft::ensure_mft_ready(root)?;
-                Ok("mft")
-            }
-            Self::Auto => {
-                if cfg!(all(windows, feature = "mft")) && is_elevated() && is_ntfs(root) {
-                    Ok("mft")
-                } else {
-                    Ok("walk")
-                }
-            }
+            // The host probes only run where they can answer; elsewhere they are false anyway.
+            Self::Walk => resolve_mode(self, built, false, false),
+            _ => resolve_mode(self, built, is_elevated(), is_ntfs(root)),
         }
+    }
+}
+
+/// Resolve the requested mode against what the build and the volume offer.
+///
+/// `auto` picks `mft` only for an elevated token on NTFS in a build with the `mft` feature, and
+/// walks everywhere else (FAT32, exFAT, ReFS, network shares). `mft` fails with exit 5 when the
+/// build or filesystem cannot do it and exit 4 when the token is not elevated.
+pub fn resolve_mode(
+    mode: ScanMode,
+    built: bool,
+    elevated: bool,
+    ntfs: bool,
+) -> Result<&'static str> {
+    match mode {
+        ScanMode::Walk => Ok("walk"),
+        ScanMode::Mft => {
+            mft::check_ready(built, ntfs, elevated)?;
+            Ok("mft")
+        }
+        ScanMode::Auto => Ok(if built && elevated && ntfs {
+            "mft"
+        } else {
+            "walk"
+        }),
     }
 }
 
@@ -152,11 +169,24 @@ pub fn run_scan_with_progress(
 
     let mut excludes = config.excludes.clone();
     excludes.extend_from_slice(extra_excludes);
+    let exact_dirs: Vec<PathBuf> = data_dir_exclusion(&target.root, &paths.home)
+        .into_iter()
+        .collect();
+    if let Some(dir) = exact_dirs.first() {
+        logger.event(
+            "excluded_data_dir",
+            &format!("snapshot={snapshot_id} path={}", dir.display()),
+        );
+    }
+    let filter = ScanFilter {
+        globs: &excludes,
+        exact_dirs: &exact_dirs,
+    };
 
     let scan_t0 = Instant::now();
     let scan_res = match resolved_mode {
-        "mft" => mft::mft_into_snapshot(conn, snapshot_id, &target.root, &excludes, progress),
-        _ => walk::walk_into_snapshot(conn, snapshot_id, &target.root, &excludes, progress).map(
+        "mft" => mft::mft_into_snapshot(conn, snapshot_id, &target.root, filter, progress),
+        _ => walk::walk_into_snapshot(conn, snapshot_id, &target.root, filter, progress).map(
             |stats| ScanOutcome {
                 stats,
                 mode: "walk",
@@ -172,15 +202,21 @@ pub fn run_scan_with_progress(
     } = match scan_res {
         Ok(o) => o,
         Err(e) => {
-            let now = chrono::Utc::now().timestamp();
-            let _ = conn.execute(
-                "UPDATE arkos_snapshots SET state = 'failed', finished_at = ?1, scan_ms = ?2 WHERE id = ?3",
-                params![now, scan_ms as i64, snapshot_id],
-            );
+            fail_snapshot(conn, snapshot_id, scan_ms);
             logger.event("scan_failed", &format!("snapshot={snapshot_id} err={e}"));
             return Err(e);
         }
     };
+
+    if stats.skipped > 0 && !stats.non_unicode.is_empty() {
+        logger.event(
+            "skipped_non_unicode",
+            &format!(
+                "snapshot={snapshot_id} names={}",
+                stats.non_unicode.join(" | ")
+            ),
+        );
+    }
 
     let rollup_t0 = Instant::now();
     rollup_snapshot(conn, snapshot_id)?;
@@ -234,4 +270,45 @@ pub fn run_scan_with_progress(
         rollup_ms,
         warning,
     })
+}
+
+/// Directory to leave out when the scan root contains Arkos's own data directory.
+///
+/// Returns the data directory's path as the walk will see it (under `root`), or `None` when the
+/// data directory is outside the root or is the root itself. This keeps the ledger, its WAL and
+/// the log out of the snapshot.
+pub fn data_dir_exclusion(root: &Path, home: &Path) -> Option<PathBuf> {
+    let root_c = std::fs::canonicalize(root).ok()?;
+    let home_c = std::fs::canonicalize(home).ok()?;
+    let rel = home_c.strip_prefix(&root_c).ok()?;
+    if rel.as_os_str().is_empty() {
+        return None;
+    }
+    Some(root.join(rel))
+}
+
+/// Mark a failed scan: delete its partial rows and set `failed` in one transaction.
+///
+/// If the cleanup itself fails (for example the disk is full) the snapshot stays `running`, and
+/// the lock-aware sweep marks it `abandoned` on the next open.
+fn fail_snapshot(conn: &mut Connection, snapshot_id: i64, scan_ms: u64) {
+    let now = chrono::Utc::now().timestamp();
+    let cleanup = (|| -> rusqlite::Result<()> {
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM arkos_files WHERE snapshot_id = ?1",
+            [snapshot_id],
+        )?;
+        tx.execute(
+            "DELETE FROM arkos_dirs WHERE snapshot_id = ?1",
+            [snapshot_id],
+        )?;
+        tx.execute(
+            "UPDATE arkos_snapshots SET state = 'failed', finished_at = ?1, scan_ms = ?2
+             WHERE id = ?3",
+            params![now, scan_ms as i64, snapshot_id],
+        )?;
+        tx.commit()
+    })();
+    let _ = cleanup;
 }

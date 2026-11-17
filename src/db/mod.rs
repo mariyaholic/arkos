@@ -6,7 +6,7 @@ use crate::exit::{Error, Result};
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Highest `PRAGMA user_version` known to Arkos M0.
@@ -70,10 +70,17 @@ pub fn open(path: &Path, busy_timeout_ms: u64, writable: bool) -> Result<Connect
 }
 
 /// Open for read-write and ensure migration 0001 is applied, then sweep abandoned scans.
+///
+/// The sweep looks for volume locks in `locks/` next to the ledger, which is where
+/// `Paths::from_home` puts them.
 pub fn open_and_migrate(path: &Path, busy_timeout_ms: u64) -> Result<Connection> {
     let conn = open(path, busy_timeout_ms, true)?;
     migrate(&conn)?;
-    retention::sweep_abandoned(&conn)?;
+    let locks_dir = path
+        .parent()
+        .map(|p| p.join("locks"))
+        .unwrap_or_else(|| PathBuf::from("locks"));
+    retention::sweep_abandoned_with_locks(&conn, &locks_dir, chrono::Utc::now().timestamp())?;
     Ok(conn)
 }
 
