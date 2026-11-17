@@ -15,10 +15,10 @@ use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::UNIX_EPOCH;
 
 const WORKER_COUNT: usize = 3;
-const BATCH_COMMIT_ENTRIES: usize = 1_000;
+pub(crate) const BATCH_COMMIT_ENTRIES: usize = 1_000;
 
 /// Most non-Unicode names kept for the scan log; the rest are only counted.
-const MAX_LOGGED_NAMES: usize = 50;
+pub(crate) const MAX_LOGGED_NAMES: usize = 50;
 
 /// Summary returned after streaming scan rows for a snapshot.
 #[derive(Debug, Default, Clone)]
@@ -40,7 +40,7 @@ pub struct ScanFilter<'a> {
 }
 
 impl ScanFilter<'_> {
-    fn excludes_exact(&self, path: &Path) -> bool {
+    pub(crate) fn excludes_exact(&self, path: &Path) -> bool {
         self.exact_dirs.iter().any(|p| same_path(p, path))
     }
 }

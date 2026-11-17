@@ -2,6 +2,7 @@
 
 pub mod mft;
 pub mod paths;
+pub mod usn;
 pub mod walk;
 
 use crate::config::Config;
@@ -70,6 +71,8 @@ pub fn resolve_mode(
 pub struct ScanOutcome {
     pub stats: WalkStats,
     pub mode: &'static str,
+    /// Set when the reader fell back to the walk or skipped a faster path, for the log.
+    pub note: Option<String>,
 }
 
 /// Outcome returned after completing a snapshot scan.
@@ -191,6 +194,7 @@ pub fn run_scan_with_progress(
             |stats| ScanOutcome {
                 stats,
                 mode: "walk",
+                note: None,
             },
         ),
     };
@@ -200,6 +204,7 @@ pub fn run_scan_with_progress(
     let ScanOutcome {
         stats,
         mode: ran_mode,
+        note,
     } = match scan_res {
         Ok(o) => o,
         Err(e) => {
@@ -209,6 +214,9 @@ pub fn run_scan_with_progress(
         }
     };
 
+    if let Some(note) = &note {
+        logger.event("scan_note", &format!("snapshot={snapshot_id} {note}"));
+    }
     if stats.skipped > 0 && !stats.non_unicode.is_empty() {
         logger.event(
             "skipped_non_unicode",
