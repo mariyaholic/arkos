@@ -78,6 +78,11 @@ pub fn html_escape(input: &str) -> String {
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
             '\'' => out.push_str("&#39;"),
+            // Bidi controls could reorder the line and make a folder name look like another
+            // path, so they are shown as visible text instead of being passed through.
+            '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200E}' | '\u{200F}' => {
+                out.push_str(&format!("&lt;U+{:04X}&gt;", ch as u32));
+            }
             _ => out.push(ch),
         }
     }
@@ -299,12 +304,6 @@ pub fn write_tree_file(
     out_path: &Path,
     max_depth: i32,
 ) -> Result<()> {
-    if out_path.exists() {
-        return Err(Error::Refused(format!(
-            "output file already exists: {}",
-            out_path.display()
-        )));
-    }
     let html = render_tree_html(conn, snapshot_id, max_depth)?;
     if let Some(parent) = out_path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent).map_err(|source| Error::Io {
@@ -312,15 +311,49 @@ pub fn write_tree_file(
             source,
         })?;
     }
-    std::fs::write(out_path, html).map_err(|source| Error::Io {
-        context: "write treemap html",
-        source,
-    })
+    write_new_file(out_path, html.as_bytes(), "write treemap html")
+}
+
+/// Create `path` and write `bytes`, refusing to replace an existing file (exit 4). The create is
+/// atomic (`create_new`), so two writers cannot both pass an existence check and then overwrite.
+pub fn write_new_file(path: &Path, bytes: &[u8], context: &'static str) -> Result<()> {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|source| {
+            if source.kind() == std::io::ErrorKind::AlreadyExists {
+                Error::Refused(format!("output file already exists: {}", path.display()))
+            } else {
+                Error::Io { context, source }
+            }
+        })?;
+    file.write_all(bytes)
+        .map_err(|source| Error::Io { context, source })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn html_escape_shows_bidi_controls_as_visible_text() {
+        assert_eq!(html_escape("a\u{202E}b"), "a&lt;U+202E&gt;b");
+        assert_eq!(
+            html_escape("\u{2066}x\u{2069}"),
+            "&lt;U+2066&gt;x&lt;U+2069&gt;"
+        );
+        assert_eq!(
+            html_escape("\u{200E}\u{200F}"),
+            "&lt;U+200E&gt;&lt;U+200F&gt;"
+        );
+        assert_eq!(
+            html_escape("\u{202A}\u{202D}"),
+            "&lt;U+202A&gt;&lt;U+202D&gt;"
+        );
+        assert_eq!(html_escape("plain <b> é"), "plain &lt;b&gt; é");
+    }
 
     #[test]
     fn relative_strips_the_root_only_at_a_separator() {

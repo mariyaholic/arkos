@@ -298,23 +298,12 @@ fn try_run() -> Result<Exit> {
             out,
             json,
         } => {
-            if let Some(ref p) = out {
-                if p.exists() {
-                    return Err(Error::Refused(format!(
-                        "output file already exists: {}",
-                        p.display()
-                    )));
-                }
-            }
             let conn = require_ledger(&paths, &config)?;
             let report = diff_snapshots(&conn, a, b, min_size, top)?;
             let text =
                 serde_json::to_string_pretty(&report).map_err(|e| Error::Cli(e.to_string()))?;
             if let Some(p) = out {
-                std::fs::write(p, &text).map_err(|source| Error::Io {
-                    context: "write diff output",
-                    source,
-                })?;
+                crate::tree::write_new_file(&p, text.as_bytes(), "write diff output")?;
             } else if json {
                 println!("{text}");
             } else {
