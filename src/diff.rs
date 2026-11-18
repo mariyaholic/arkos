@@ -2,6 +2,7 @@
 
 use crate::db::map_db_err;
 use crate::exit::{Error, Result};
+use crate::fmt::join_display;
 use rusqlite::{params, Connection};
 use serde::Serialize;
 
@@ -48,11 +49,17 @@ pub struct DiffReport {
 
 /// Validate that both snapshots exist, belong to the same volume, and reached `complete` state.
 pub fn validate_diff_pair(conn: &Connection, snap_a: i64, snap_b: i64) -> Result<String> {
-    let fetch = |id: i64| -> Result<(String, String)> {
+    let fetch = |id: i64| -> Result<(String, String, String)> {
         conn.query_row(
-            "SELECT volume, state FROM arkos_snapshots WHERE id = ?1",
+            "SELECT volume, state, root FROM arkos_snapshots WHERE id = ?1",
             [id],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            },
         )
         .map_err(|e| match e {
             rusqlite::Error::QueryReturnedNoRows => {
@@ -62,8 +69,8 @@ pub fn validate_diff_pair(conn: &Connection, snap_a: i64, snap_b: i64) -> Result
         })
     };
 
-    let (vol_a, state_a) = fetch(snap_a)?;
-    let (vol_b, state_b) = fetch(snap_b)?;
+    let (vol_a, state_a, root_a) = fetch(snap_a)?;
+    let (vol_b, state_b, root_b) = fetch(snap_b)?;
     if state_a != "complete" {
         return Err(Error::Input(format!(
             "snapshot {snap_a} is '{state_a}' and cannot be diffed"
@@ -79,11 +86,53 @@ pub fn validate_diff_pair(conn: &Connection, snap_a: i64, snap_b: i64) -> Result
             "snapshots {snap_a} ({vol_a}) and {snap_b} ({vol_b}) belong to different volumes"
         )));
     }
+    if root_a != root_b {
+        return Err(Error::Refused(format!(
+            "snapshots {snap_a} (root {root_a}) and {snap_b} (root {root_b}) have different roots"
+        )));
+    }
     Ok(vol_a)
 }
 
-/// Compute top directory and file deltas between `snap_a` and `snap_b`.
+/// One entry of the shared ranking: a directory or a file change.
+enum Change {
+    Dir(DirDiff),
+    File(FileDiff),
+}
+
+impl Change {
+    fn delta(&self) -> i64 {
+        match self {
+            Change::Dir(d) => d.delta_bytes,
+            Change::File(f) => f.delta_bytes,
+        }
+    }
+
+    fn path(&self) -> &str {
+        match self {
+            Change::Dir(d) => &d.path,
+            Change::File(f) => &f.path,
+        }
+    }
+}
+
+/// Compute the top `top` changes between `snap_a` and `snap_b`.
+///
+/// Directories and files share one ranking by absolute delta (ties by path). `min_size` filters
+/// before the cut, and `dirs` and `files` in the report hold the entries that survived it.
 pub fn diff_snapshots(
+    conn: &Connection,
+    snap_a: i64,
+    snap_b: i64,
+    min_size: i64,
+    top: usize,
+) -> Result<DiffReport> {
+    crate::db::read_tx(conn, || {
+        diff_snapshots_inner(conn, snap_a, snap_b, min_size, top)
+    })
+}
+
+fn diff_snapshots_inner(
     conn: &Connection,
     snap_a: i64,
     snap_b: i64,
@@ -108,7 +157,7 @@ pub fn diff_snapshots(
         )
         .map_err(map_db_err)?;
 
-    let mut dirs = Vec::new();
+    let mut changes: Vec<Change> = Vec::new();
     let dir_rows = dir_stmt
         .query_map(params![snap_a, snap_b], |r| {
             Ok((
@@ -132,23 +181,16 @@ pub fn diff_snapshots(
         };
         let delta_bytes = after_bytes - before_bytes;
         if delta_bytes.abs() >= min_size {
-            dirs.push(DirDiff {
+            changes.push(Change::Dir(DirDiff {
                 path,
                 kind,
                 before_bytes,
                 after_bytes,
                 delta_bytes,
                 delta_files,
-            });
+            }));
         }
     }
-    dirs.sort_by(|x, y| {
-        y.delta_bytes
-            .abs()
-            .cmp(&x.delta_bytes.abs())
-            .then_with(|| x.path.cmp(&y.path))
-    });
-    dirs.truncate(top);
 
     // File-level diff joined through directory path.
     let mut file_stmt = conn
@@ -175,7 +217,6 @@ pub fn diff_snapshots(
         )
         .map_err(map_db_err)?;
 
-    let mut files = Vec::new();
     let file_rows = file_stmt
         .query_map(params![snap_a, snap_b], |r| {
             Ok((
@@ -198,27 +239,32 @@ pub fn diff_snapshots(
         };
         let delta_bytes = after_size - before_size;
         if delta_bytes.abs() >= min_size {
-            let sep = if dir_path.ends_with(['\\', '/']) {
-                ""
-            } else {
-                "\\"
-            };
-            files.push(FileDiff {
-                path: format!("{dir_path}{sep}{name}"),
+            changes.push(Change::File(FileDiff {
+                path: join_display(&dir_path, &name),
                 kind,
                 before_size,
                 after_size,
                 delta_bytes,
-            });
+            }));
         }
     }
-    files.sort_by(|x, y| {
-        y.delta_bytes
+
+    changes.sort_by(|x, y| {
+        y.delta()
             .abs()
-            .cmp(&x.delta_bytes.abs())
-            .then_with(|| x.path.cmp(&y.path))
+            .cmp(&x.delta().abs())
+            .then_with(|| x.path().cmp(y.path()))
     });
-    files.truncate(top);
+    changes.truncate(top);
+
+    let mut dirs = Vec::new();
+    let mut files = Vec::new();
+    for change in changes {
+        match change {
+            Change::Dir(d) => dirs.push(d),
+            Change::File(f) => files.push(f),
+        }
+    }
 
     Ok(DiffReport {
         snapshot_a: snap_a,

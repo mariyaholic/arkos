@@ -2,7 +2,10 @@
 
 use crate::db::map_db_err;
 use crate::exit::Result;
+use crate::lock::VolumeLock;
 use rusqlite::{params, Connection};
+use serde::Serialize;
+use std::path::Path;
 
 const STALE_RUNNING_AGE_SECS: i64 = 24 * 3600;
 const INCREMENTAL_VACUUM_THRESHOLD_BYTES: u64 = 32 * 1024 * 1024;
@@ -13,16 +16,18 @@ pub fn sweep_abandoned(conn: &Connection) -> Result<usize> {
     sweep_abandoned_at(conn, now)
 }
 
+fn has_snapshots_table(conn: &Connection) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='arkos_snapshots')",
+        [],
+        |r| r.get(0),
+    )
+    .map_err(map_db_err)
+}
+
 /// Testable variant of [`sweep_abandoned`] with explicit current timestamp.
 pub fn sweep_abandoned_at(conn: &Connection, now: i64) -> Result<usize> {
-    let exists: bool = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='arkos_snapshots')",
-            [],
-            |r| r.get(0),
-        )
-        .map_err(map_db_err)?;
-    if !exists {
+    if !has_snapshots_table(conn)? {
         return Ok(0);
     }
     let cutoff = now - STALE_RUNNING_AGE_SECS;
@@ -36,38 +41,134 @@ pub fn sweep_abandoned_at(conn: &Connection, now: i64) -> Result<usize> {
     Ok(changed)
 }
 
-/// Delete old completed snapshots beyond `keep`, leaving `running` snapshots untouched.
+/// Mark `running` snapshots `abandoned` when nothing holds their volume lock.
+///
+/// A scan holds its volume lock from before it inserts the `running` row until after it sets the
+/// final state, and the OS drops the lock when the process dies. So a `running` row whose lock
+/// can be taken without waiting belongs to a dead scan. When the lock directory cannot be used,
+/// the row falls back to the 24 hour rule.
+pub fn sweep_abandoned_with_locks(conn: &Connection, locks_dir: &Path, now: i64) -> Result<usize> {
+    if !has_snapshots_table(conn)? {
+        return Ok(0);
+    }
+    let mut stmt = conn
+        .prepare("SELECT id, volume, started_at FROM arkos_snapshots WHERE state = 'running'")
+        .map_err(map_db_err)?;
+    let running: Vec<(i64, String, i64)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .map_err(map_db_err)?
+        .collect::<std::result::Result<_, _>>()
+        .map_err(map_db_err)?;
+    drop(stmt);
+
+    let mut changed = 0usize;
+    for (id, volume, started_at) in running {
+        let dead = match VolumeLock::is_free(locks_dir, &volume) {
+            Ok(free) => free,
+            Err(_) => started_at < now - STALE_RUNNING_AGE_SECS,
+        };
+        if dead {
+            changed += conn
+                .execute(
+                    "UPDATE arkos_snapshots SET state = 'abandoned', finished_at = ?1
+                     WHERE id = ?2 AND state = 'running'",
+                    params![now, id],
+                )
+                .map_err(map_db_err)?;
+        }
+    }
+    Ok(changed)
+}
+
+/// A snapshot that a prune would delete.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PruneCandidate {
+    pub id: i64,
+    pub volume: String,
+    pub root: String,
+    pub state: String,
+    pub started_at: i64,
+    pub bytes: i64,
+}
+
+/// List the snapshots a prune would delete.
+///
+/// Snapshots are grouped by `(volume, root)`, so a subtree scan never pushes out a full-volume
+/// snapshot. In each group the newest `keep` completed snapshots stay and older completed ones
+/// are candidates. `failed` and `abandoned` rows are always candidates, whatever the number of
+/// completed snapshots, because they cannot be diffed and an abandoned scan may hold partial
+/// rows. `running` snapshots are never candidates. [`prune_completed`] deletes exactly this list.
+pub fn plan_prune(
+    conn: &Connection,
+    volume_filter: Option<&str>,
+    keep: u32,
+) -> Result<Vec<PruneCandidate>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, volume, root, state, started_at, bytes FROM arkos_snapshots
+             WHERE state <> 'running' AND (?1 IS NULL OR volume = ?1)
+             ORDER BY volume, root, started_at DESC, id DESC",
+        )
+        .map_err(map_db_err)?;
+    let rows = stmt
+        .query_map(params![volume_filter], |r| {
+            Ok(PruneCandidate {
+                id: r.get(0)?,
+                volume: r.get(1)?,
+                root: r.get(2)?,
+                state: r.get(3)?,
+                started_at: r.get(4)?,
+                bytes: r.get(5)?,
+            })
+        })
+        .map_err(map_db_err)?;
+    let mut all = Vec::new();
+    for row in rows {
+        all.push(row.map_err(map_db_err)?);
+    }
+
+    let keep = keep as usize;
+    let mut out = Vec::new();
+    let mut start = 0;
+    while start < all.len() {
+        let mut end = start + 1;
+        while end < all.len()
+            && all[end].volume == all[start].volume
+            && all[end].root == all[start].root
+        {
+            end += 1;
+        }
+        let group = &all[start..end];
+        let complete: Vec<&PruneCandidate> =
+            group.iter().filter(|c| c.state == "complete").collect();
+        for c in group {
+            let drop_it = if c.state == "complete" {
+                complete
+                    .iter()
+                    .position(|x| x.id == c.id)
+                    .is_some_and(|rank| rank >= keep)
+            } else {
+                true
+            };
+            if drop_it {
+                out.push(c.clone());
+            }
+        }
+        start = end;
+    }
+    Ok(out)
+}
+
+/// Delete the snapshots [`plan_prune`] lists, leaving `running` snapshots untouched.
 ///
 /// Only runs `PRAGMA incremental_vacuum(2048)` when freelist exceeds 32 MiB; never runs full `VACUUM`.
 pub fn prune_completed(conn: &Connection, volume_filter: Option<&str>, keep: u32) -> Result<usize> {
-    let volumes: Vec<String> = match volume_filter {
-        Some(v) => vec![v.to_owned()],
-        None => {
-            let mut stmt = conn.prepare("SELECT DISTINCT volume FROM arkos_snapshots")?;
-            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-            let mut out = Vec::new();
-            for row in rows {
-                out.push(row?);
-            }
-            out
-        }
-    };
-
+    let plan = plan_prune(conn, volume_filter, keep)?;
     let mut deleted_total = 0usize;
-    for volume in volumes {
-        let deleted = conn
-            .execute(
-                "DELETE FROM arkos_snapshots
-                 WHERE id IN (
-                   SELECT id FROM arkos_snapshots
-                   WHERE volume = ?1 AND state = 'complete'
-                   ORDER BY started_at DESC, id DESC
-                   LIMIT -1 OFFSET ?2
-                 )",
-                params![volume, keep as i64],
-            )
+    for candidate in &plan {
+        deleted_total += conn
+            .execute("DELETE FROM arkos_snapshots WHERE id = ?1", [candidate.id])
             .map_err(map_db_err)?;
-        deleted_total += deleted;
     }
 
     if deleted_total > 0 {

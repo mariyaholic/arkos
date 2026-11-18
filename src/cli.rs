@@ -4,12 +4,15 @@ use crate::config::Config;
 use crate::db::{self, map_db_err};
 use crate::diff::diff_snapshots;
 use crate::exit::{Error, Exit, Result};
+use crate::fmt::{format_delta, format_size};
 use crate::logging::Logger;
 use crate::paths::{PathEnvironment, Paths};
-use crate::probe::{build_probe_doc, status_probe_exit};
-use crate::scan::{run_scan, ScanMode};
+use crate::probe::{build_probe_doc, running_scans, status_probe_exit_with_locks};
+use crate::progress::Reporter;
+use crate::scan::{run_scan_with_progress, ScanMode};
 use crate::top::{query_top, TopBy};
 use crate::tree::write_tree_file;
+use crate::volumes::volume_key;
 use clap::{Parser, Subcommand};
 use rusqlite::params;
 use serde::Serialize;
@@ -38,6 +41,9 @@ enum Command {
         label: Option<String>,
         #[arg(long, value_enum, default_value_t = ScanMode::Auto)]
         mode: ScanMode,
+        /// Allow `--mode mft`, the NTFS MFT reader, which is experimental and untested.
+        #[arg(long)]
+        experimental: bool,
         #[arg(long = "exclude")]
         excludes: Vec<String>,
         #[arg(long)]
@@ -87,7 +93,7 @@ enum Command {
         #[arg(long, default_value_t = 4)]
         depth: i32,
     },
-    /// Delete old completed snapshots while keeping the newest N per volume.
+    /// Delete old completed snapshots while keeping the newest N per volume and root.
     Prune {
         #[arg(long)]
         keep: Option<u32>,
@@ -95,6 +101,9 @@ enum Command {
         volume: Option<String>,
         #[arg(long)]
         yes: bool,
+        /// Print what would be deleted and exit 0 without deleting.
+        #[arg(long, conflicts_with = "yes")]
+        dry_run: bool,
         #[arg(long)]
         json: bool,
     },
@@ -195,11 +204,24 @@ fn try_run() -> Result<Exit> {
             path,
             label,
             mode,
+            experimental,
             excludes,
             json,
         } => {
-            let mut conn = db::open_and_migrate(&paths.db, config.busy_timeout_ms)?;
-            let report = run_scan(
+            if mode == ScanMode::Mft {
+                if !experimental {
+                    return Err(Error::Cli(
+                        "--mode mft is experimental; pass --experimental to use it, or use --mode walk"
+                            .into(),
+                    ));
+                }
+                eprintln!(
+                    "note: the MFT reader is experimental and untested; compare it with --mode walk (scripts/compare-mft.ps1)"
+                );
+            }
+            let mut conn = db::open_and_migrate(&paths.db, &paths.locks, config.busy_timeout_ms)?;
+            let mut progress = Reporter::auto(json);
+            let report = run_scan_with_progress(
                 &mut conn,
                 &paths,
                 &config,
@@ -209,6 +231,7 @@ fn try_run() -> Result<Exit> {
                 label.as_deref(),
                 mode,
                 &excludes,
+                &mut progress,
             )?;
             if json {
                 println!(
@@ -217,19 +240,21 @@ fn try_run() -> Result<Exit> {
                 );
             } else {
                 println!(
-                    "snapshot={} volume={} mode={} dirs={} files={} bytes={} scan_ms={} rollup_ms={}",
+                    "snapshot={} volume={} mode={} dirs={} files={} size={} scan_ms={} rollup_ms={}",
                     report.snapshot_id,
                     report.volume,
                     report.mode,
                     report.dirs,
                     report.files,
-                    report.bytes,
+                    format_size(report.bytes.min(i64::MAX as u64) as i64),
                     report.scan_ms,
                     report.rollup_ms
                 );
+                println!("placeholders={}", report.placeholders);
                 if let Some(w) = report.warning {
                     println!("warning: {w}");
                 }
+                println!("note: {}", crate::fmt::SIZE_NOTE);
             }
             Ok(Exit::Ok)
         }
@@ -238,8 +263,11 @@ fn try_run() -> Result<Exit> {
             limit,
             json,
         } => {
-            let conn = db::open_and_migrate(&paths.db, config.busy_timeout_ms)?;
-            let rows = list_snapshots(&conn, volume.as_deref(), limit)?;
+            let volume = volume.as_deref().map(volume_key).transpose()?;
+            let rows = match db::open_read(&paths.db, config.busy_timeout_ms)? {
+                Some(conn) => list_snapshots(&conn, volume.as_deref(), limit)?,
+                None => Vec::new(),
+            };
             if json {
                 println!(
                     "{}",
@@ -248,8 +276,15 @@ fn try_run() -> Result<Exit> {
             } else {
                 for r in rows {
                     println!(
-                        "#{:<4} {:<6} {:<10} {:<5} {:>10} files {:>12} B  denied={}  {}",
-                        r.id, r.volume, r.state, r.mode, r.files, r.bytes, r.denied, r.root
+                        "#{:<4} {:<6} {:<10} {:<5} {:>10} files {:>11}  denied={}  {}",
+                        r.id,
+                        r.volume,
+                        r.state,
+                        r.mode,
+                        r.files,
+                        format_size(r.bytes),
+                        r.denied,
+                        r.root
                     );
                 }
             }
@@ -271,7 +306,7 @@ fn try_run() -> Result<Exit> {
                     )));
                 }
             }
-            let conn = db::open_and_migrate(&paths.db, config.busy_timeout_ms)?;
+            let conn = require_ledger(&paths, &config)?;
             let report = diff_snapshots(&conn, a, b, min_size, top)?;
             let text =
                 serde_json::to_string_pretty(&report).map_err(|e| Error::Cli(e.to_string()))?;
@@ -288,10 +323,20 @@ fn try_run() -> Result<Exit> {
                     report.snapshot_a, report.snapshot_b, report.volume
                 );
                 for d in &report.dirs {
-                    println!("dir  {:?} {:>+12} B  {}", d.kind, d.delta_bytes, d.path);
+                    println!(
+                        "dir  {:<7} {:>11}  {}",
+                        format!("{:?}", d.kind),
+                        format_delta(d.delta_bytes),
+                        d.path
+                    );
                 }
                 for f in &report.files {
-                    println!("file {:?} {:>+12} B  {}", f.kind, f.delta_bytes, f.path);
+                    println!(
+                        "file {:<7} {:>11}  {}",
+                        format!("{:?}", f.kind),
+                        format_delta(f.delta_bytes),
+                        f.path
+                    );
                 }
             }
             Ok(Exit::Ok)
@@ -303,7 +348,7 @@ fn try_run() -> Result<Exit> {
             limit,
             json,
         } => {
-            let conn = db::open_and_migrate(&paths.db, config.busy_timeout_ms)?;
+            let conn = require_ledger(&paths, &config)?;
             let items = query_top(&conn, snapshot, dirs, by, limit)?;
             if json {
                 println!(
@@ -312,7 +357,7 @@ fn try_run() -> Result<Exit> {
                 );
             } else {
                 for item in items {
-                    println!("{:>12} B  {}", item.bytes, item.path);
+                    println!("{:>11}  {}", format_size(item.bytes), item.path);
                 }
             }
             Ok(Exit::Ok)
@@ -322,7 +367,7 @@ fn try_run() -> Result<Exit> {
             out,
             depth,
         } => {
-            let conn = db::open_and_migrate(&paths.db, config.busy_timeout_ms)?;
+            let conn = require_ledger(&paths, &config)?;
             write_tree_file(&conn, snapshot, &out, depth)?;
             println!("wrote treemap {}", out.display());
             Ok(Exit::Ok)
@@ -331,31 +376,65 @@ fn try_run() -> Result<Exit> {
             keep,
             volume,
             yes,
+            dry_run,
             json,
         } => {
-            if !yes {
-                return Err(Error::Cli("prune requires --yes".into()));
-            }
             let keep = keep.unwrap_or(config.snapshots_keep);
             if !(1..=12).contains(&keep) {
                 return Err(Error::Cli("--keep must be between 1 and 12".into()));
             }
-            let conn = db::open_and_migrate(&paths.db, config.busy_timeout_ms)?;
-            let deleted = db::retention::prune_completed(&conn, volume.as_deref(), keep)?;
+            let volume = volume.as_deref().map(volume_key).transpose()?;
+            let conn = db::open_and_migrate(&paths.db, &paths.locks, config.busy_timeout_ms)?;
+            if yes {
+                let deleted = db::retention::prune_completed(&conn, volume.as_deref(), keep)?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({ "deleted_snapshots": deleted, "keep": keep })
+                    );
+                } else {
+                    println!(
+                        "pruned {deleted} snapshot(s), kept latest {keep} complete per volume and root"
+                    );
+                }
+                return Ok(Exit::Ok);
+            }
+            let plan = db::retention::plan_prune(&conn, volume.as_deref(), keep)?;
             if json {
                 println!(
                     "{}",
-                    serde_json::json!({ "deleted_snapshots": deleted, "keep": keep })
+                    serde_json::json!({ "dry_run": dry_run, "keep": keep, "candidates": plan })
                 );
             } else {
-                println!("pruned {deleted} snapshot(s), kept latest {keep} complete per volume");
+                println!(
+                    "would delete {} snapshot(s), keeping latest {keep} complete per volume and root",
+                    plan.len()
+                );
+                for c in &plan {
+                    println!(
+                        "  #{:<4} {:<6} {:>11}  {}",
+                        c.id,
+                        c.volume,
+                        format_size(c.bytes),
+                        c.root
+                    );
+                }
             }
-            Ok(Exit::Ok)
+            if dry_run {
+                Ok(Exit::Ok)
+            } else {
+                Err(Error::Cli("nothing deleted; pass --yes to delete these snapshots, or --dry-run to preview".into()))
+            }
         }
         Command::Status { probe, json } => {
-            let conn = db::open_and_migrate(&paths.db, config.busy_timeout_ms)?;
-            let code = status_probe_exit(&conn)?;
-            let info = db::info(&conn)?;
+            let (code, info, running) = match db::open_read(&paths.db, config.busy_timeout_ms)? {
+                Some(conn) => (
+                    status_probe_exit_with_locks(&conn, &paths.locks)?,
+                    db::info(&conn)?,
+                    running_scans(&conn, &paths.locks)?,
+                ),
+                None => (Exit::Ok, db::info(&empty_ledger()?)?, Vec::new()),
+            };
             if probe && !json {
                 println!("probe={}", code.code());
             } else if json {
@@ -364,6 +443,7 @@ fn try_run() -> Result<Exit> {
                     serde_json::to_string_pretty(&serde_json::json!({
                         "probe_exit": code.code(),
                         "db": info,
+                        "running": running,
                     }))
                     .map_err(|e| Error::Cli(e.to_string()))?
                 );
@@ -376,6 +456,9 @@ fn try_run() -> Result<Exit> {
                     info.counts.get("arkos_files").copied().unwrap_or(0),
                     code.code(),
                 );
+                for r in &running {
+                    println!("scan #{} {} {}", r.id, r.volume, r.health);
+                }
             }
             if probe {
                 Ok(code)
@@ -385,8 +468,10 @@ fn try_run() -> Result<Exit> {
         }
         Command::Db { action } => match action {
             DbAction::Info { json } => {
-                let conn = db::open_and_migrate(&paths.db, config.busy_timeout_ms)?;
-                let info = db::info(&conn)?;
+                let info = match db::open_read(&paths.db, config.busy_timeout_ms)? {
+                    Some(conn) => db::info(&conn)?,
+                    None => db::info(&empty_ledger()?)?,
+                };
                 if json {
                     println!(
                         "{}",
@@ -406,13 +491,13 @@ fn try_run() -> Result<Exit> {
                 Ok(Exit::Ok)
             }
             DbAction::Migrate => {
-                let conn = db::open_and_migrate(&paths.db, config.busy_timeout_ms)?;
+                let conn = db::open_and_migrate(&paths.db, &paths.locks, config.busy_timeout_ms)?;
                 let ver: u32 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
                 println!("migrated shimatsu.sqlite user_version={ver}");
                 Ok(Exit::Ok)
             }
             DbAction::Vacuum => {
-                let conn = db::open_and_migrate(&paths.db, config.busy_timeout_ms)?;
+                let conn = db::open_and_migrate(&paths.db, &paths.locks, config.busy_timeout_ms)?;
                 let reclaimed = db::vacuum(&conn)?;
                 println!("vacuum reclaimed {reclaimed} bytes");
                 Ok(Exit::Ok)
@@ -420,6 +505,21 @@ fn try_run() -> Result<Exit> {
         },
         Command::Paths { .. } | Command::Probe => unreachable!(),
     }
+}
+
+/// An in-memory ledger standing in for a ledger file that does not exist yet.
+fn empty_ledger() -> Result<rusqlite::Connection> {
+    rusqlite::Connection::open_in_memory().map_err(map_db_err)
+}
+
+/// Open the ledger read-only for a verb that needs a snapshot to exist.
+fn require_ledger(paths: &Paths, config: &Config) -> Result<rusqlite::Connection> {
+    db::open_read(&paths.db, config.busy_timeout_ms)?.ok_or_else(|| {
+        Error::Input(format!(
+            "no ledger at {}; run `arkos scan` first",
+            paths.db.display()
+        ))
+    })
 }
 
 fn list_snapshots(

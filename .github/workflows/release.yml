@@ -1,0 +1,48 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    env:
+      SIGNING_CERT_BASE64: ${{ secrets.SIGNING_CERT_BASE64 }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - run: cargo build --release --target x86_64-pc-windows-msvc
+      - name: Collect the binary
+        shell: pwsh
+        run: |
+          Copy-Item target/x86_64-pc-windows-msvc/release/arkos.exe arkos.exe
+      # Signing runs only when the repository has a certificate configured. The secret is read
+      # from the repository settings and is never written to this file.
+      - name: Sign
+        if: ${{ env.SIGNING_CERT_BASE64 != '' }}
+        shell: pwsh
+        env:
+          SIGNING_CERT_PASSWORD: ${{ secrets.SIGNING_CERT_PASSWORD }}
+        run: |
+          [IO.File]::WriteAllBytes("cert.pfx", [Convert]::FromBase64String($env:SIGNING_CERT_BASE64))
+          & signtool sign /f cert.pfx /p $env:SIGNING_CERT_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 arkos.exe
+          Remove-Item cert.pfx
+      - name: Checksum
+        shell: pwsh
+        run: |
+          $h = (Get-FileHash arkos.exe -Algorithm SHA256).Hash.ToLower()
+          "$h  arkos.exe" | Out-File -Encoding ascii arkos.exe.sha256
+      # A tag with a hyphen (for example v0.2.0-exp.1) is a prerelease and is not marked latest.
+      - uses: softprops/action-gh-release@v2
+        with:
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          make_latest: ${{ !contains(github.ref_name, '-') }}
+          files: |
+            arkos.exe
+            arkos.exe.sha256

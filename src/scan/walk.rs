@@ -2,6 +2,7 @@
 
 use crate::db::map_db_err;
 use crate::exit::{Error, Result};
+use crate::progress::Reporter;
 use crate::scan::paths::{
     matches_any_exclude, normalize_display_path, normalize_ext, to_os_open_path,
 };
@@ -14,7 +15,18 @@ use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::UNIX_EPOCH;
 
 const WORKER_COUNT: usize = 3;
-const BATCH_COMMIT_ENTRIES: usize = 1_000;
+/// Rows per transaction before a commit.
+pub(crate) const BATCH_COMMIT_ENTRIES: usize = 50_000;
+/// Longest a transaction stays open, so a slow tree still commits and shows progress.
+pub(crate) const BATCH_COMMIT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// True when a batch with `ops` rows opened at `since` should commit now.
+pub(crate) fn commit_due(ops: usize, since: std::time::Instant) -> bool {
+    ops >= BATCH_COMMIT_ENTRIES || since.elapsed() >= BATCH_COMMIT_INTERVAL
+}
+
+/// Most non-Unicode names kept for the scan log; the rest are only counted.
+pub(crate) const MAX_LOGGED_NAMES: usize = 50;
 
 /// Summary returned after streaming scan rows for a snapshot.
 #[derive(Debug, Default, Clone)]
@@ -24,6 +36,36 @@ pub struct WalkStats {
     pub bytes: u64,
     pub denied: u64,
     pub skipped: u64,
+    /// Cloud placeholder files (recall or offline attribute), counted with their logical size.
+    pub placeholders: u64,
+    /// Lossy forms of entries skipped because their names are not valid Unicode (capped).
+    pub non_unicode: Vec<String>,
+    /// How many entries were skipped for non-Unicode names, including those not listed.
+    pub non_unicode_total: u64,
+}
+
+/// What the walk leaves out: name or path globs, and exact directories.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ScanFilter<'a> {
+    pub globs: &'a [String],
+    pub exact_dirs: &'a [PathBuf],
+}
+
+impl ScanFilter<'_> {
+    pub(crate) fn excludes_exact(&self, path: &Path) -> bool {
+        self.exact_dirs.iter().any(|p| same_path(p, path))
+    }
+}
+
+#[cfg(windows)]
+fn same_path(a: &Path, b: &Path) -> bool {
+    a.to_string_lossy()
+        .eq_ignore_ascii_case(&b.to_string_lossy())
+}
+
+#[cfg(not(windows))]
+fn same_path(a: &Path, b: &Path) -> bool {
+    a == b
 }
 
 #[derive(Debug)]
@@ -115,7 +157,8 @@ pub fn walk_into_snapshot(
     conn: &mut Connection,
     snapshot_id: i64,
     root: &Path,
-    excludes: &[String],
+    filter: ScanFilter<'_>,
+    progress: &mut Reporter,
 ) -> Result<WalkStats> {
     let root_meta = fs::symlink_metadata(to_os_open_path(root)).map_err(|source| Error::Io {
         context: "stat scan root",
@@ -139,6 +182,8 @@ pub fn walk_into_snapshot(
     let next_token = Arc::new(AtomicU64::new(2));
     let denied = Arc::new(AtomicU64::new(0));
     let skipped = Arc::new(AtomicU64::new(0));
+    let placeholders = Arc::new(AtomicU64::new(0));
+    let non_unicode = Arc::new(Mutex::new((0u64, Vec::<String>::new())));
     let (tx, rx) = mpsc::sync_channel::<WriterMsg>(64);
 
     let mut stats = WalkStats::default();
@@ -150,17 +195,19 @@ pub fn walk_into_snapshot(
             let nt = Arc::clone(&next_token);
             let den = Arc::clone(&denied);
             let skp = Arc::clone(&skipped);
+            let ph = Arc::clone(&placeholders);
+            let nu = Arc::clone(&non_unicode);
             let wtx = tx.clone();
             scope.spawn(move || {
                 while let Some(item) = q.pop() {
-                    process_dir(&item, excludes, &q, &nt, &den, &skp, &wtx);
+                    process_dir(&item, filter, &q, &nt, &den, &skp, &ph, &nu, &wtx);
                     q.finish_one();
                 }
             });
         }
         drop(tx);
 
-        match consume_and_insert(conn, snapshot_id, rx) {
+        match consume_and_insert(conn, snapshot_id, rx, progress) {
             Ok((dirs, files, bytes)) => {
                 stats.dirs = dirs;
                 stats.files = files;
@@ -180,16 +227,26 @@ pub fn walk_into_snapshot(
 
     stats.denied = denied.load(Ordering::Acquire);
     stats.skipped = skipped.load(Ordering::Acquire);
+    stats.placeholders = placeholders.load(Ordering::Acquire);
+    {
+        let guard = non_unicode.lock().expect("non-unicode list");
+        stats.non_unicode_total = guard.0;
+        stats.non_unicode = guard.1.clone();
+    }
+    stats.non_unicode.sort();
     Ok(stats)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process_dir(
     item: &WorkItem,
-    excludes: &[String],
+    filter: ScanFilter<'_>,
     queue: &WorkQueue,
     next_token: &AtomicU64,
     denied: &AtomicU64,
     skipped: &AtomicU64,
+    placeholders: &AtomicU64,
+    non_unicode: &Mutex<(u64, Vec<String>)>,
     tx: &mpsc::SyncSender<WriterMsg>,
 ) {
     let open_path = to_os_open_path(&item.path);
@@ -235,11 +292,31 @@ fn process_dir(
                 continue;
             }
         };
-        let entry_name = entry.file_name().to_string_lossy().into_owned();
+        // A name that is not valid Unicode cannot be stored faithfully, and a lossy form could
+        // collide with a real name under the (snapshot_id, dir_id, name) key. Skip and count it.
+        let entry_name = match entry.file_name().into_string() {
+            Ok(name) => name,
+            Err(raw) => {
+                skipped.fetch_add(1, Ordering::Relaxed);
+                let mut names = non_unicode.lock().expect("non-unicode list");
+                names.0 += 1;
+                if names.1.len() < MAX_LOGGED_NAMES {
+                    names.1.push(format!(
+                        "{}{}{}",
+                        normalize_display_path(&item.path),
+                        std::path::MAIN_SEPARATOR,
+                        raw.to_string_lossy()
+                    ));
+                }
+                continue;
+            }
+        };
         let child_path = item.path.join(&entry_name);
         let child_display = normalize_display_path(&child_path);
 
-        if matches_any_exclude(&entry_name, &child_display, excludes) {
+        if filter.excludes_exact(&child_path)
+            || matches_any_exclude(&entry_name, &child_display, filter.globs)
+        {
             skipped.fetch_add(1, Ordering::Relaxed);
             continue;
         }
@@ -261,7 +338,13 @@ fn process_dir(
             }
         };
 
-        if is_reparse_or_symlink(&meta) {
+        // A cloud placeholder file is a reparse point too, but it is an ordinary file with a
+        // logical size, so it is counted and sized like any other file.
+        let placeholder = !meta.is_dir() && is_placeholder(&meta);
+        if placeholder {
+            placeholders.fetch_add(1, Ordering::Relaxed);
+        }
+        if !placeholder && is_reparse_or_symlink(&meta) {
             // Policy (§5.3): record reparse points as size-0 entries with ext=NULL, never follow.
             files.push(FileEntry {
                 name: entry_name,
@@ -307,6 +390,7 @@ fn consume_and_insert(
     conn: &mut Connection,
     snapshot_id: i64,
     rx: mpsc::Receiver<WriterMsg>,
+    progress: &mut Reporter,
 ) -> Result<(u64, u64, u64)> {
     let mut dirs = 0u64;
     let mut files = 0u64;
@@ -316,6 +400,7 @@ fn consume_and_insert(
 
     let mut tx = conn.transaction().map_err(map_db_err)?;
     let mut ops_in_tx = 0usize;
+    let mut tx_since = std::time::Instant::now();
 
     for msg in rx {
         let dir = match msg {
@@ -362,10 +447,12 @@ fn consume_and_insert(
                 dir_files += 1;
             }
 
-            tx.execute(
+            tx.prepare_cached(
                 "INSERT INTO arkos_dirs(snapshot_id, parent_id, path, name, depth, mtime, bytes, files)
                  VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![
+            )
+            .and_then(|mut stmt| {
+                stmt.execute(params![
                     snapshot_id,
                     parent_id,
                     node.path,
@@ -374,8 +461,8 @@ fn consume_and_insert(
                     node.mtime,
                     dir_bytes,
                     dir_files
-                ],
-            )
+                ])
+            })
             .map_err(map_db_err)?;
             let dir_id = tx.last_insert_rowid();
             token_to_id.insert(node.token, dir_id);
@@ -397,6 +484,7 @@ fn consume_and_insert(
                     ops_in_tx += 1;
                 }
             }
+            progress.tick(files, dirs, bytes);
 
             if let Some(children) = pending.remove(&node.token) {
                 for ch in children.into_iter().rev() {
@@ -404,10 +492,11 @@ fn consume_and_insert(
                 }
             }
 
-            if ops_in_tx >= BATCH_COMMIT_ENTRIES {
+            if commit_due(ops_in_tx, tx_since) {
                 tx.commit().map_err(map_db_err)?;
                 tx = conn.transaction().map_err(map_db_err)?;
                 ops_in_tx = 0;
+                tx_since = std::time::Instant::now();
             }
         }
     }
@@ -433,17 +522,29 @@ fn modified_epoch(meta: &Metadata) -> Option<i64> {
         .map(|d| d.as_secs() as i64)
 }
 
+#[cfg(windows)]
+fn is_placeholder(meta: &Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    crate::scan::paths::attrs_are_placeholder(meta.file_attributes())
+}
+
+#[cfg(not(windows))]
+fn is_placeholder(_meta: &Metadata) -> bool {
+    false
+}
+
 fn is_reparse_or_symlink(meta: &Metadata) -> bool {
-    if meta.file_type().is_symlink() {
-        return true;
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
-        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return true;
-        }
-    }
+    meta.file_type().is_symlink() || has_reparse_attr(meta)
+}
+
+#[cfg(windows)]
+fn has_reparse_attr(meta: &Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn has_reparse_attr(_meta: &Metadata) -> bool {
     false
 }

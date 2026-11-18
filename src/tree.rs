@@ -6,6 +6,9 @@
 
 use crate::db::map_db_err;
 use crate::exit::{Error, Result};
+pub use crate::fmt::format_size;
+use crate::fmt::{join_display, SIZE_NOTE};
+use crate::treemap::{self, DirRow};
 use rusqlite::{params, Connection};
 use std::fmt::Write;
 use std::path::Path;
@@ -29,10 +32,15 @@ h1{margin:.25rem 0 .5rem;font:600 clamp(1.4rem,3.4vw,2.1rem) var(--font-display)
 h2{margin:2.5rem 0 .75rem;font:600 1rem var(--font-body);color:var(--platinum);letter-spacing:.02em}
 .meta{display:flex;flex-wrap:wrap;gap:8px 24px;margin:0;padding:0;list-style:none;font:.8rem var(--font-mono);color:var(--muted)}
 .meta b{color:var(--gold-bright);font-weight:500}
+.note{margin:.75rem 0 0;color:var(--muted);font-size:.8rem}
 .warn{margin:1rem 0 0;padding:8px 12px;border-left:3px solid var(--lining);background:var(--lining-dim);color:var(--platinum);border-radius:var(--radius-sm)}
 .panel{margin-top:1.5rem;padding:16px;background:var(--bg-panel);border:1px solid var(--line);border-radius:var(--radius-lg)}
 svg{display:block;width:100%;height:auto}
-svg rect{stroke:var(--bg-panel);stroke-width:2}
+svg rect{stroke:var(--bg-panel);stroke-width:1}
+.c0{fill:var(--gold)}.c1{fill:var(--lavender)}.c2{fill:var(--sage)}.c3{fill:var(--marigold)}.c4{fill:var(--gold-dim)}.c5{fill:var(--platinum)}.cf{fill:var(--slate)}
+.l1{fill-opacity:.88}.l2{fill-opacity:.74}.l3{fill-opacity:.62}.l4{fill-opacity:.52}.l5{fill-opacity:.44}
+svg rect.f{fill-opacity:.26}
+.hd{font:10px var(--font-mono);fill:var(--platinum);stroke:var(--bg-deepest);stroke-width:2.5px;paint-order:stroke;pointer-events:none}
 .legend{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:6px 16px;margin:12px 0 0;padding:0;list-style:none;font-size:.85rem}
 .legend li{display:flex;align-items:baseline;gap:8px;min-width:0}
 .sw{flex:none;width:10px;height:10px;border-radius:2px}
@@ -48,7 +56,8 @@ td.num,th.num{text-align:right;font-family:var(--font-mono);font-variant-numeric
 td.dim{color:var(--slate)}
 "#;
 
-/// Fill ramp for top-level folders, drawn from canon roles. Red lining is left out on purpose:
+/// Fill ramp for top-level folders, drawn from canon roles. The map uses the matching `.c0` to
+/// `.c5` classes; the legend swatches use these values. Red lining is left out on purpose:
 /// it is reserved for warnings.
 const FILLS: [&str; 6] = [
     "var(--gold)",
@@ -56,7 +65,7 @@ const FILLS: [&str; 6] = [
     "var(--sage)",
     "var(--marigold)",
     "var(--gold-dim)",
-    "var(--wine)",
+    "var(--platinum)",
 ];
 
 /// Escape HTML special characters so untrusted filenames cannot inject markup or scripts.
@@ -91,23 +100,14 @@ pub fn relative(path: &str, root: &str) -> String {
     }
 }
 
-/// Format a byte count in binary units (`B`, `KiB`, `MiB`, `GiB`, `TiB`).
-pub fn format_size(bytes: i64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    if bytes.unsigned_abs() < 1024 {
-        return format!("{bytes} B");
-    }
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value.abs() >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    format!("{value:.1} {}", UNITS[unit])
-}
-
 /// Render a static HTML + SVG report for `snapshot_id` up to `max_depth`.
 pub fn render_tree_html(conn: &Connection, snapshot_id: i64, max_depth: i32) -> Result<String> {
+    crate::db::read_tx(conn, || {
+        render_tree_html_inner(conn, snapshot_id, max_depth)
+    })
+}
+
+fn render_tree_html_inner(conn: &Connection, snapshot_id: i64, max_depth: i32) -> Result<String> {
     let (volume, root, total_bytes, denied): (String, String, i64, i64) = conn
         .query_row(
             "SELECT volume, root, bytes, denied FROM arkos_snapshots WHERE id = ?1 AND state = 'complete'",
@@ -194,46 +194,64 @@ pub fn render_tree_html(conn: &Connection, snapshot_id: i64, max_depth: i32) -> 
         .ok();
     }
 
-    // Deterministic horizontal strip treemap over the largest top-level folders.
-    let top: Vec<&(String, String, i32, i64, i64)> =
-        rows.iter().filter(|r| r.2 == 1).take(12).collect();
-    writeln!(html, "<h2>Top-level folders</h2><section class=\"panel\">").ok();
-    writeln!(
-        html,
-        "<svg viewBox=\"0 0 1000 160\" preserveAspectRatio=\"none\" role=\"img\" aria-label=\"Size of the largest top-level folders\">"
-    )
-    .ok();
+    writeln!(html, "<p class=\"note\">{}</p>", html_escape(SIZE_NOTE)).ok();
+
+    // Nested squarified treemap over every directory down to `max_depth`.
+    let dir_rows: Vec<DirRow> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, parent_id, path, name, depth, bytes
+                 FROM arkos_dirs WHERE snapshot_id = ?1 AND depth <= ?2
+                 ORDER BY depth ASC, id ASC",
+            )
+            .map_err(map_db_err)?;
+        let mapped = stmt
+            .query_map(params![snapshot_id, max_depth], |r| {
+                Ok(DirRow {
+                    id: r.get(0)?,
+                    parent_id: r.get(1)?,
+                    path: r.get(2)?,
+                    name: r.get(3)?,
+                    depth: r.get(4)?,
+                    bytes: r.get(5)?,
+                })
+            })
+            .map_err(map_db_err)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(map_db_err)?;
+        mapped
+    };
+    let map = treemap::render(&dir_rows, max_depth);
+    writeln!(html, "<h2>Treemap</h2><section class=\"panel\">").ok();
     let denom = total_bytes.max(1) as f64;
-    let mut cursor_x = 0.0f64;
-    let mut drawn = 0usize;
-    for (idx, (_, name, _, bytes, _)) in top.iter().copied().enumerate() {
-        let w = ((*bytes as f64 / denom) * 1000.0).max(2.0);
-        let fill = FILLS[idx % FILLS.len()];
-        writeln!(
-            html,
-            "<rect x=\"{cursor_x:.1}\" y=\"0\" width=\"{w:.1}\" height=\"160\" rx=\"4\" style=\"fill:{fill}\"><title>{} · {}</title></rect>",
-            html_escape(name),
-            format_size(*bytes)
-        )
-        .ok();
-        drawn += 1;
-        cursor_x += w;
-        if cursor_x >= 1000.0 {
-            break;
+    match &map {
+        Some(map) => {
+            writeln!(
+                html,
+                "<svg viewBox=\"0 0 {} {}\" role=\"img\" aria-label=\"Nested treemap of folder sizes\">",
+                treemap::VIEW_W,
+                treemap::VIEW_H
+            )
+            .ok();
+            html.push_str(&map.svg);
+            writeln!(html, "</svg><ul class=\"legend\">").ok();
+            for (idx, color) in map.top.iter().take(12) {
+                let row = &dir_rows[*idx];
+                let pct = row.bytes as f64 * 100.0 / denom;
+                writeln!(
+                    html,
+                    "<li><span class=\"sw\" style=\"background:{}\"></span><span class=\"p\" title=\"{}\">{}</span><span class=\"n\">{} · {pct:.1}%</span></li>",
+                    FILLS[*color % FILLS.len()],
+                    html_escape(&row.path),
+                    html_escape(&row.name),
+                    format_size(row.bytes)
+                )
+                .ok();
+            }
         }
-    }
-    writeln!(html, "</svg><ul class=\"legend\">").ok();
-    for (idx, (path, name, _, bytes, _)) in top.iter().copied().take(drawn).enumerate() {
-        let pct = *bytes as f64 * 100.0 / denom;
-        writeln!(
-            html,
-            "<li><span class=\"sw\" style=\"background:{}\"></span><span class=\"p\" title=\"{}\">{}</span><span class=\"n\">{} · {pct:.1}%</span></li>",
-            FILLS[idx % FILLS.len()],
-            html_escape(path),
-            html_escape(name),
-            format_size(*bytes)
-        )
-        .ok();
+        None => {
+            writeln!(html, "<p class=\"note\">Nothing to draw: the snapshot holds no bytes.</p><ul class=\"legend\">").ok();
+        }
     }
     writeln!(html, "</ul></section>").ok();
 
@@ -260,12 +278,7 @@ pub fn render_tree_html(conn: &Connection, snapshot_id: i64, max_depth: i32) -> 
     )
     .ok();
     for (dir_path, name, size) in &files {
-        let sep = if dir_path.ends_with(['\\', '/']) {
-            ""
-        } else {
-            "\\"
-        };
-        let full = format!("{dir_path}{sep}{name}");
+        let full = join_display(dir_path, name);
         writeln!(
             html,
             "<tr><td class=\"path\" title=\"{}\">{}</td><td class=\"num\" title=\"{size} B\">{}</td></tr>",
@@ -310,15 +323,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn format_size_uses_binary_units() {
-        assert_eq!(format_size(0), "0 B");
-        assert_eq!(format_size(1023), "1023 B");
-        assert_eq!(format_size(1024), "1.0 KiB");
-        assert_eq!(format_size(5 * 1024 * 1024 + 512 * 1024), "5.5 MiB");
-        assert_eq!(format_size(3 * 1024_i64.pow(4)), "3.0 TiB");
-    }
-
-    #[test]
     fn relative_strips_the_root_only_at_a_separator() {
         assert_eq!(relative(r"C:\a\b", r"C:\a"), "b");
         assert_eq!(relative(r"C:\", r"C:\"), ".");
@@ -333,5 +337,9 @@ mod tests {
         assert!(STYLE.contains("--bg-ground:#0b0913"));
         assert!(!STYLE.contains("http"));
         assert!(!FILLS.contains(&"var(--lining)"));
+        assert!(!FILLS.contains(&"var(--wine)"));
+        // Only the warning block may use the red lining; the map classes never do.
+        let map_css = &STYLE[STYLE.find(".c0{").unwrap()..STYLE.find(".hd{").unwrap()];
+        assert!(!map_css.contains("lining") && !map_css.contains("wine"));
     }
 }

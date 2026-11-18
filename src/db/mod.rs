@@ -46,9 +46,22 @@ pub fn open(path: &Path, busy_timeout_ms: u64, writable: bool) -> Result<Connect
 
     if writable {
         let _ = conn.pragma_update(None, "auto_vacuum", "INCREMENTAL");
-        let mode: String = conn
-            .pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get(0))
-            .map_err(map_db_err)?;
+        // Switching the journal mode ignores the busy handler, so retry within the timeout.
+        let deadline = std::time::Instant::now() + Duration::from_millis(busy_timeout_ms);
+        let mode: String = loop {
+            match conn.pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get(0)) {
+                Ok(m) => break m,
+                Err(e) => match map_db_err(e) {
+                    Error::Busy(msg) => {
+                        if std::time::Instant::now() >= deadline {
+                            return Err(Error::Busy(msg));
+                        }
+                        std::thread::sleep(Duration::from_millis(25));
+                    }
+                    other => return Err(other),
+                },
+            }
+        };
         if !mode.eq_ignore_ascii_case("wal") {
             return Err(Error::Io {
                 context: "enable WAL mode",
@@ -69,16 +82,89 @@ pub fn open(path: &Path, busy_timeout_ms: u64, writable: bool) -> Result<Connect
     Ok(conn)
 }
 
+/// Page cache during a scan, in KiB (32 MiB). Keeps the index pages of a large insert resident.
+const SCAN_CACHE_KIB: i64 = 32 * 1024;
+/// Page cache outside a scan, in KiB (4 MiB).
+const IDLE_CACHE_KIB: i64 = 4 * 1024;
+/// WAL auto-checkpoint outside a scan, in pages.
+const IDLE_WAL_AUTOCHECKPOINT: i64 = 256;
+
+/// Switch a writable connection to scan tuning: a 32 MiB page cache and no automatic WAL
+/// checkpoint, so the scan's transactions do not stop to checkpoint. Pair with [`end_bulk_write`].
+pub fn begin_bulk_write(conn: &Connection) -> Result<()> {
+    conn.execute_batch(&format!(
+        "PRAGMA cache_size=-{SCAN_CACHE_KIB}; PRAGMA wal_autocheckpoint=0;"
+    ))
+    .map_err(map_db_err)
+}
+
+/// Undo [`begin_bulk_write`]: restore the defaults and fold the WAL back into the database file.
+/// The checkpoint is best effort; a reader that blocks it leaves the WAL for a later checkpoint.
+pub fn end_bulk_write(conn: &Connection) {
+    let _ = conn.execute_batch(&format!(
+        "PRAGMA cache_size=-{IDLE_CACHE_KIB}; PRAGMA wal_autocheckpoint={IDLE_WAL_AUTOCHECKPOINT};"
+    ));
+    let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+}
+
 /// Open for read-write and ensure migration 0001 is applied, then sweep abandoned scans.
-pub fn open_and_migrate(path: &Path, busy_timeout_ms: u64) -> Result<Connection> {
+///
+/// `locks_dir` is where volume locks live (`Paths::locks`); the sweep checks it to tell a live
+/// scan from a dead one. Used by the verbs that write: `scan`, `prune`, `db migrate`, `db vacuum`.
+pub fn open_and_migrate(path: &Path, locks_dir: &Path, busy_timeout_ms: u64) -> Result<Connection> {
     let conn = open(path, busy_timeout_ms, true)?;
     migrate(&conn)?;
-    retention::sweep_abandoned(&conn)?;
+    retention::sweep_abandoned_with_locks(&conn, locks_dir, chrono::Utc::now().timestamp())?;
     Ok(conn)
 }
 
-/// Apply Arkos schema 0001 idempotently inside `BEGIN IMMEDIATE`.
+/// Open an existing ledger read-only for the verbs that only read. It never migrates, sweeps,
+/// creates a file or takes the write lock. Returns `None` when there is no ledger yet (no file, or
+/// a file with no `arkos_*` tables and `user_version` 0), which callers treat as an empty ledger.
+pub fn open_read(path: &Path, busy_timeout_ms: u64) -> Result<Option<Connection>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let conn = open(path, busy_timeout_ms, false)?;
+    let ver: u32 = conn
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .map_err(map_db_err)?;
+    if ver == 0 {
+        if arkos_tables_exist(&conn)? {
+            return Err(inconsistent());
+        }
+        return Ok(None);
+    }
+    Ok(Some(conn))
+}
+
+fn arkos_tables_exist(conn: &Connection) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name LIKE 'arkos\\_%' ESCAPE '\\')",
+        [],
+        |r| r.get(0),
+    )
+    .map_err(map_db_err)
+}
+
+fn inconsistent() -> Error {
+    Error::Refused("ledger.inconsistent: tables present but user_version is 0".into())
+}
+
+/// Apply Arkos schema 0001. A ledger that is already at the known version is left alone without
+/// taking the write lock; otherwise the check and the script run inside `BEGIN IMMEDIATE`.
 pub fn migrate(conn: &Connection) -> Result<u32> {
+    let ver: u32 = conn
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .map_err(map_db_err)?;
+    if ver > KNOWN_MAX_VERSION {
+        return Err(Error::Refused(format!(
+            "ledger.newer: database user_version {ver} exceeds supported {KNOWN_MAX_VERSION}"
+        )));
+    }
+    if ver == KNOWN_MAX_VERSION {
+        return Ok(KNOWN_MAX_VERSION);
+    }
     conn.execute_batch("BEGIN IMMEDIATE;").map_err(map_db_err)?;
     let res = (|| -> Result<u32> {
         let ver: u32 = conn
@@ -90,6 +176,9 @@ pub fn migrate(conn: &Connection) -> Result<u32> {
             )));
         }
         if ver == 0 {
+            if arkos_tables_exist(conn)? {
+                return Err(inconsistent());
+            }
             conn.execute_batch(MIGRATION_0001).map_err(map_db_err)?;
             conn.pragma_update(None, "user_version", KNOWN_MAX_VERSION)
                 .map_err(map_db_err)?;
@@ -106,6 +195,18 @@ pub fn migrate(conn: &Connection) -> Result<u32> {
             Err(e)
         }
     }
+}
+
+/// Run `f` inside one deferred read transaction, so every statement in it sees one snapshot of
+/// the ledger even if another process commits (for example a prune) in between.
+pub fn read_tx<T>(conn: &Connection, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    if !conn.is_autocommit() {
+        return f();
+    }
+    conn.execute_batch("BEGIN DEFERRED;").map_err(map_db_err)?;
+    let out = f();
+    let _ = conn.execute_batch("COMMIT;");
+    out
 }
 
 /// Map SQLite busy/locked errors to `Error::Busy` (exit 6).

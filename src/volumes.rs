@@ -1,6 +1,7 @@
 //! Volume normalization, filesystem type checks, and elevation detection.
 
 use crate::exit::{Error, Result};
+use crate::scan::paths::normalize_display_path;
 use std::path::{Path, PathBuf};
 
 /// Normalized scan target describing volume key (`C:`) and concrete root path.
@@ -17,7 +18,7 @@ pub fn resolve_target(volume: &str, subpath: Option<&Path>) -> Result<ScanTarget
         return Err(Error::Cli("--volume must not be empty".into()));
     }
 
-    let (norm_vol, base_root) = normalize_volume(trimmed)?;
+    let (norm_vol, base_root) = parse_volume(trimmed)?;
     let root = match subpath {
         Some(sub) => {
             if sub.is_absolute() {
@@ -54,7 +55,22 @@ pub fn resolve_target(volume: &str, subpath: Option<&Path>) -> Result<ScanTarget
     })
 }
 
-fn normalize_volume(input: &str) -> Result<(String, PathBuf)> {
+/// The canonical volume key for a `--volume` argument, shared by `scan`, `list --volume` and
+/// `prune --volume` so the same input always names the same ledger rows.
+///
+/// A drive letter becomes `C:`, a volume GUID path keeps its form, and a directory becomes
+/// `dir:<absolute path>` using the canonical path (without the `\\?\` prefix on Windows) when the
+/// directory exists, or the lexically cleaned absolute path when it no longer does. A stored key
+/// (`dir:/x`) is accepted as input too.
+pub fn volume_key(input: &str) -> Result<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err(Error::Cli("--volume must not be empty".into()));
+    }
+    parse_volume(trimmed).map(|(key, _)| key)
+}
+
+fn parse_volume(input: &str) -> Result<(String, PathBuf)> {
     let cleaned = input.trim_end_matches(['\\', '/']);
     let bytes = cleaned.as_bytes();
     if bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
@@ -68,14 +84,28 @@ fn normalize_volume(input: &str) -> Result<(String, PathBuf)> {
         let root = PathBuf::from(format!("{vol}\\"));
         return Ok((vol, root));
     }
-    let p = PathBuf::from(input);
-    if p.is_dir() {
-        let vol = format!("dir:{}", p.to_string_lossy());
-        return Ok((vol, p));
+    let path_text = input.strip_prefix("dir:").unwrap_or(input);
+    let p = PathBuf::from(path_text);
+    if let Ok(canon) = std::fs::canonicalize(&p) {
+        if canon.is_dir() {
+            let root = PathBuf::from(normalize_display_path(&canon));
+            return Ok((format!("dir:{}", root.to_string_lossy()), root));
+        }
+    }
+    if p.is_absolute() {
+        let root = lexical_clean(&p);
+        return Ok((format!("dir:{}", root.to_string_lossy()), root));
     }
     Err(Error::Cli(format!(
-        "unsupported --volume format (expected e.g. C: or existing directory): {input}"
+        "unsupported --volume format (expected e.g. C: or an existing directory): {input}"
     )))
+}
+
+/// Drop `.` parts and trailing separators without touching the filesystem.
+fn lexical_clean(p: &Path) -> PathBuf {
+    p.components()
+        .filter(|c| !matches!(c, std::path::Component::CurDir))
+        .collect()
 }
 
 fn is_network_path(path: &Path) -> bool {

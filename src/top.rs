@@ -2,6 +2,7 @@
 
 use crate::db::map_db_err;
 use crate::exit::{Error, Result};
+use crate::fmt::join_display;
 use clap::ValueEnum;
 use rusqlite::{params, Connection};
 use serde::Serialize;
@@ -26,6 +27,16 @@ pub struct TopItem {
 
 /// Return top directories or top files inside `snapshot_id`.
 pub fn query_top(
+    conn: &Connection,
+    snapshot_id: i64,
+    dirs: bool,
+    by: TopBy,
+    limit: usize,
+) -> Result<Vec<TopItem>> {
+    crate::db::read_tx(conn, || query_top_inner(conn, snapshot_id, dirs, by, limit))
+}
+
+fn query_top_inner(
     conn: &Connection,
     snapshot_id: i64,
     dirs: bool,
@@ -94,13 +105,8 @@ pub fn query_top(
             .query_map(params![snapshot_id, limit as i64], |r| {
                 let dir_path: String = r.get(0)?;
                 let name: String = r.get(1)?;
-                let sep = if dir_path.ends_with(['\\', '/']) {
-                    ""
-                } else {
-                    "\\"
-                };
                 Ok(TopItem {
-                    path: format!("{dir_path}{sep}{name}"),
+                    path: join_display(&dir_path, &name),
                     bytes: r.get(2)?,
                     files: None,
                     mtime: Some(r.get(3)?),

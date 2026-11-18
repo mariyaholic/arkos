@@ -22,6 +22,19 @@ pub fn to_os_open_path(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
+/// `FILE_ATTRIBUTE_OFFLINE`: the data is not available locally.
+const ATTR_OFFLINE: u32 = 0x0000_1000;
+/// `FILE_ATTRIBUTE_RECALL_ON_OPEN`: opening the file brings the data back.
+const ATTR_RECALL_ON_OPEN: u32 = 0x0004_0000;
+/// `FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS`: reading the data brings it back (cloud placeholders).
+const ATTR_RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
+
+/// True when Windows file attributes mark a cloud placeholder: a file whose data lives online.
+/// Its logical size is still reported, so the scan counts the file and keeps that size.
+pub fn attrs_are_placeholder(attrs: u32) -> bool {
+    attrs & (ATTR_OFFLINE | ATTR_RECALL_ON_OPEN | ATTR_RECALL_ON_DATA_ACCESS) != 0
+}
+
 /// Strip Windows `\\?\` display prefix so stored `arkos_dirs.path` stays human-readable.
 pub fn normalize_display_path(path: &Path) -> String {
     let raw = path.to_string_lossy();
@@ -37,13 +50,32 @@ pub fn normalize_display_path(path: &Path) -> String {
     raw.into_owned()
 }
 
-/// Extract lowercased extension without dot (`None` for extensionless or leading-dot dotfiles).
+/// Archive suffixes kept whole, so `backup.tar.gz` groups as `tar.gz` and not `gz`.
+const COMPOUND_EXTS: [&str; 7] = [
+    "tar.gz", "tar.bz2", "tar.xz", "tar.zst", "tar.lz", "tar.lzma", "tar.z",
+];
+
+/// Extract the lowercased extension without a dot (`None` for extensionless names, leading-dot
+/// dotfiles and a trailing dot).
+///
+/// A fixed list of compound archive suffixes is stored whole; every other name keeps the text
+/// after its last dot. A name must be longer than the suffix plus its dot to count, so a file
+/// named exactly `.tar.gz` is treated as the dotfile it is and falls through to the last dot.
 pub fn normalize_ext(file_name: &str) -> Option<String> {
+    let lower = file_name.to_ascii_lowercase();
+    for suffix in COMPOUND_EXTS {
+        if lower.len() > suffix.len() + 1
+            && lower.ends_with(suffix)
+            && lower.as_bytes()[lower.len() - suffix.len() - 1] == b'.'
+        {
+            return Some(suffix.to_owned());
+        }
+    }
     let dot = file_name.rfind('.')?;
     if dot == 0 || dot + 1 >= file_name.len() {
         return None;
     }
-    Some(file_name[dot + 1..].to_ascii_lowercase())
+    Some(lower[dot + 1..].to_owned())
 }
 
 /// Simple case-insensitive `*` / `?` glob matching for `--exclude`.
@@ -90,12 +122,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn placeholder_attributes_are_recognised() {
+        assert!(attrs_are_placeholder(0x0040_0000)); // RECALL_ON_DATA_ACCESS
+        assert!(attrs_are_placeholder(0x0004_0000 | 0x20)); // RECALL_ON_OPEN, archive
+        assert!(attrs_are_placeholder(0x1000)); // OFFLINE
+        assert!(!attrs_are_placeholder(0x20)); // archive only
+        assert!(!attrs_are_placeholder(0x400 | 0x10)); // reparse directory
+    }
+
+    #[test]
     fn ext_normalizes_lowercase_and_ignores_dotfiles() {
         assert_eq!(normalize_ext("Photo.JPG").as_deref(), Some("jpg"));
-        assert_eq!(normalize_ext("archive.tar.GZ").as_deref(), Some("gz"));
+        assert_eq!(normalize_ext("archive.tar.GZ").as_deref(), Some("tar.gz"));
         assert_eq!(normalize_ext("Makefile"), None);
         assert_eq!(normalize_ext(".gitignore"), None);
         assert_eq!(normalize_ext("trailing."), None);
+    }
+
+    #[test]
+    fn compound_archive_extensions_are_stored_whole() {
+        for (name, want) in [
+            ("a.tar.gz", "tar.gz"),
+            ("a.tar.bz2", "tar.bz2"),
+            ("a.TAR.XZ", "tar.xz"),
+            ("a.tar.zst", "tar.zst"),
+            ("a.tar.lz", "tar.lz"),
+            ("a.tar.lzma", "tar.lzma"),
+            ("a.tar.z", "tar.z"),
+            ("many.dots.in.name.tar.gz", "tar.gz"),
+        ] {
+            assert_eq!(normalize_ext(name).as_deref(), Some(want), "{name}");
+        }
+        // Not on the list, or no separating dot, or nothing before the suffix.
+        assert_eq!(normalize_ext("a.tar.7z").as_deref(), Some("7z"));
+        assert_eq!(normalize_ext("atar.gz").as_deref(), Some("gz"));
+        assert_eq!(normalize_ext("a.tgz").as_deref(), Some("tgz"));
+        assert_eq!(normalize_ext(".tar.gz").as_deref(), Some("gz"));
+        assert_eq!(normalize_ext("tar.gz").as_deref(), Some("gz"));
+        assert_eq!(normalize_ext("x.tar.gz.").as_deref(), None);
+        assert_eq!(normalize_ext("archive.tar").as_deref(), Some("tar"));
     }
 
     #[test]
