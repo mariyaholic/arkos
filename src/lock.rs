@@ -6,6 +6,9 @@ use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+/// Most times `acquire` reopens the lock file after finding that it was replaced under the lock.
+const MAX_IDENTITY_RETRIES: usize = 5;
+
 /// Advisory volume lock held for the lifetime of a mutating scan.
 #[derive(Debug)]
 pub struct VolumeLock {
@@ -21,43 +24,57 @@ impl VolumeLock {
             source,
         })?;
         let path = lock_path_for(locks_dir, volume);
-        let mut file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&path)
-            .map_err(|source| Error::Io {
-                context: "open volume lock file",
-                source,
-            })?;
-
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-        loop {
-            match try_lock_exclusive(&file) {
-                Ok(true) => break,
-                Ok(false) => {
-                    if Instant::now() >= deadline {
-                        let holder = std::fs::read_to_string(&path).unwrap_or_default();
-                        let suffix = if holder.trim().is_empty() {
-                            String::new()
-                        } else {
-                            format!(": {}", holder.trim())
-                        };
-                        return Err(Error::Busy(format!(
-                            "volume lock for {volume} is held past {timeout_ms}ms{suffix}"
-                        )));
+        let mut file = None;
+        // A holder of an unlinked lock file does not conflict with a new file at the same path.
+        // After each successful lock, check that the handle still is the file at the path.
+        for _ in 0..MAX_IDENTITY_RETRIES {
+            let candidate = OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .open(&path)
+                .map_err(|source| Error::Io {
+                    context: "open volume lock file",
+                    source,
+                })?;
+            loop {
+                match try_lock_exclusive(&candidate) {
+                    Ok(true) => break,
+                    Ok(false) => {
+                        if Instant::now() >= deadline {
+                            let holder = std::fs::read_to_string(&path).unwrap_or_default();
+                            let suffix = if holder.trim().is_empty() {
+                                String::new()
+                            } else {
+                                format!(": {}", holder.trim())
+                            };
+                            return Err(Error::Busy(format!(
+                                "volume lock for {volume} is held past {timeout_ms}ms{suffix}"
+                            )));
+                        }
+                        std::thread::sleep(Duration::from_millis(25));
                     }
-                    std::thread::sleep(Duration::from_millis(25));
-                }
-                Err(source) => {
-                    return Err(Error::Io {
-                        context: "lock volume file",
-                        source,
-                    })
+                    Err(source) => {
+                        return Err(Error::Io {
+                            context: "lock volume file",
+                            source,
+                        })
+                    }
                 }
             }
+            if same_file_as_path(&candidate, &path) {
+                file = Some(candidate);
+                break;
+            }
+            let _ = unlock_exclusive(&candidate);
         }
+        let Some(mut file) = file else {
+            return Err(Error::Busy(format!(
+                "volume lock for {volume} kept changing identity; the lock file was replaced {MAX_IDENTITY_RETRIES} times"
+            )));
+        };
 
         // Write diagnostic holder metadata to offset 0 (advisory lock covers a high byte range on Windows).
         let diag = serde_json::json!({
@@ -203,4 +220,49 @@ fn try_lock_exclusive(file: &File) -> std::io::Result<bool> {
 #[cfg(not(windows))]
 fn unlock_exclusive(file: &File) -> std::io::Result<()> {
     file.unlock()
+}
+
+/// True when the open handle and the file now at `path` are the same file.
+#[cfg(not(windows))]
+fn same_file_as_path(file: &File, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (file.metadata(), std::fs::metadata(path)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
+}
+
+#[cfg(windows)]
+fn same_file_as_path(file: &File, path: &Path) -> bool {
+    use std::os::windows::fs::OpenOptionsExt;
+    // Share read, write and delete so this open never blocks another holder or a delete.
+    const SHARE_ALL: u32 = 0x1 | 0x2 | 0x4;
+    let Ok(fresh) = OpenOptions::new()
+        .read(true)
+        .share_mode(SHARE_ALL)
+        .open(path)
+    else {
+        return false;
+    };
+    match (file_identity(file), file_identity(&fresh)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Volume serial number and file index from `GetFileInformationByHandle`.
+#[cfg(windows)]
+fn file_identity(file: &File) -> Option<(u32, u32, u32)> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut info) };
+    (ok != 0).then_some((
+        info.dwVolumeSerialNumber,
+        info.nFileIndexHigh,
+        info.nFileIndexLow,
+    ))
 }

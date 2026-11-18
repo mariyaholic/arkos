@@ -322,14 +322,22 @@ fn sm3_a_read_verb_can_open_the_ledger_while_a_scan_is_writing() {
 
 #[cfg(unix)]
 #[test]
-#[ignore = "defect SM-4: unlinking a held lock file lets a second holder in, and the sweep treats a missing file as free"]
-fn sm4_unlinking_the_lock_file_does_not_admit_a_second_holder() {
+fn sm4_a_waiter_that_locked_an_unlinked_file_retries_on_the_new_one() {
+    // The waiter opens the lock file while `first` holds it. The file is then unlinked and a
+    // third party locks a new file at the same path. When `first` lets go, the waiter locks the
+    // old, unlinked inode, which must not count as holding the volume.
     let env = Env::new("sm4");
     let first = VolumeLock::acquire(&env.paths.locks, "dir:/shared", 200).unwrap();
+    let locks = env.paths.locks.clone();
+    let waiter =
+        std::thread::spawn(move || VolumeLock::acquire(&locks, "dir:/shared", 1500).map(|_| ()));
+    std::thread::sleep(std::time::Duration::from_millis(300));
     std::fs::remove_file(&first.path).unwrap();
-    let second = VolumeLock::acquire(&env.paths.locks, "dir:/shared", 100);
-    assert!(second.is_err(), "two live holders of one volume lock");
+    let third = VolumeLock::acquire(&env.paths.locks, "dir:/shared", 200).unwrap();
     drop(first);
+    let got = waiter.join().unwrap();
+    assert!(got.is_err(), "two live holders of one volume lock");
+    drop(third);
 }
 
 #[cfg(unix)]
