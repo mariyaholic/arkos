@@ -82,6 +82,31 @@ pub fn open(path: &Path, busy_timeout_ms: u64, writable: bool) -> Result<Connect
     Ok(conn)
 }
 
+/// Page cache during a scan, in KiB (32 MiB). Keeps the index pages of a large insert resident.
+const SCAN_CACHE_KIB: i64 = 32 * 1024;
+/// Page cache outside a scan, in KiB (4 MiB).
+const IDLE_CACHE_KIB: i64 = 4 * 1024;
+/// WAL auto-checkpoint outside a scan, in pages.
+const IDLE_WAL_AUTOCHECKPOINT: i64 = 256;
+
+/// Switch a writable connection to scan tuning: a 32 MiB page cache and no automatic WAL
+/// checkpoint, so the scan's transactions do not stop to checkpoint. Pair with [`end_bulk_write`].
+pub fn begin_bulk_write(conn: &Connection) -> Result<()> {
+    conn.execute_batch(&format!(
+        "PRAGMA cache_size=-{SCAN_CACHE_KIB}; PRAGMA wal_autocheckpoint=0;"
+    ))
+    .map_err(map_db_err)
+}
+
+/// Undo [`begin_bulk_write`]: restore the defaults and fold the WAL back into the database file.
+/// The checkpoint is best effort; a reader that blocks it leaves the WAL for a later checkpoint.
+pub fn end_bulk_write(conn: &Connection) {
+    let _ = conn.execute_batch(&format!(
+        "PRAGMA cache_size=-{IDLE_CACHE_KIB}; PRAGMA wal_autocheckpoint={IDLE_WAL_AUTOCHECKPOINT};"
+    ));
+    let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+}
+
 /// Open for read-write and ensure migration 0001 is applied, then sweep abandoned scans.
 ///
 /// `locks_dir` is where volume locks live (`Paths::locks`); the sweep checks it to tell a live

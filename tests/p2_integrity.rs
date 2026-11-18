@@ -152,7 +152,8 @@ fn failed_cleanup_leaves_running_and_the_next_open_abandons_it() {
     env.conn.execute_batch(FAIL_AT_1500).unwrap();
     env.conn
         .execute_batch(
-            "CREATE TRIGGER no_cleanup BEFORE DELETE ON arkos_files
+            "CREATE TRIGGER no_cleanup BEFORE UPDATE OF state ON arkos_snapshots
+             WHEN NEW.state = 'failed'
              BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
         )
         .unwrap();
@@ -164,11 +165,6 @@ fn failed_cleanup_leaves_running_and_the_next_open_abandons_it() {
         })
         .unwrap();
     assert_eq!(state, "running");
-    let partial: i64 = env
-        .conn
-        .query_row("SELECT count(*) FROM arkos_files", [], |r| r.get(0))
-        .unwrap();
-    assert!(partial > 0, "the fixture should have committed a batch");
 
     let conn2 = db::open_and_migrate(&env.paths.db, &env.paths.locks, 1000).unwrap();
     assert_eq!(state_of(&conn2, id), "abandoned");

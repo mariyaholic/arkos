@@ -8,7 +8,7 @@ use crate::db::map_db_err;
 use crate::exit::{Error, Result};
 use crate::progress::Reporter;
 use crate::scan::paths::{matches_any_exclude, normalize_display_path, normalize_ext};
-use crate::scan::walk::{ScanFilter, WalkStats, BATCH_COMMIT_ENTRIES, MAX_LOGGED_NAMES};
+use crate::scan::walk::{commit_due, ScanFilter, WalkStats, MAX_LOGGED_NAMES};
 use rusqlite::{params, Connection};
 use std::collections::HashMap;
 use std::io;
@@ -179,10 +179,11 @@ fn note_non_unicode(stats: &mut WalkStats, parent_path: &str, name: &str) {
     }
 }
 
-/// Commits every `BATCH_COMMIT_ENTRIES` writes and starts the next transaction.
+/// Commits every 50,000 writes or 2 seconds and starts the next transaction.
 struct Batch<'a> {
     conn: &'a Connection,
     ops: usize,
+    since: std::time::Instant,
 }
 
 impl Batch<'_> {
@@ -192,8 +193,9 @@ impl Batch<'_> {
 
     fn wrote(&mut self) -> Result<()> {
         self.ops += 1;
-        if self.ops >= BATCH_COMMIT_ENTRIES {
+        if commit_due(self.ops, self.since) {
             self.ops = 0;
+            self.since = std::time::Instant::now();
             self.conn
                 .execute_batch("COMMIT; BEGIN")
                 .map_err(map_db_err)?;
@@ -226,7 +228,11 @@ pub fn scan_with_source(
     progress: &mut Reporter,
     dir_limit: usize,
 ) -> Result<UsnScan> {
-    let mut batch = Batch { conn, ops: 0 };
+    let mut batch = Batch {
+        conn,
+        ops: 0,
+        since: std::time::Instant::now(),
+    };
     let res = run(
         &mut batch,
         snapshot_id,

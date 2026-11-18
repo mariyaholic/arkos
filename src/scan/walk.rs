@@ -15,7 +15,15 @@ use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::UNIX_EPOCH;
 
 const WORKER_COUNT: usize = 3;
-pub(crate) const BATCH_COMMIT_ENTRIES: usize = 1_000;
+/// Rows per transaction before a commit.
+pub(crate) const BATCH_COMMIT_ENTRIES: usize = 50_000;
+/// Longest a transaction stays open, so a slow tree still commits and shows progress.
+pub(crate) const BATCH_COMMIT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// True when a batch with `ops` rows opened at `since` should commit now.
+pub(crate) fn commit_due(ops: usize, since: std::time::Instant) -> bool {
+    ops >= BATCH_COMMIT_ENTRIES || since.elapsed() >= BATCH_COMMIT_INTERVAL
+}
 
 /// Most non-Unicode names kept for the scan log; the rest are only counted.
 pub(crate) const MAX_LOGGED_NAMES: usize = 50;
@@ -380,6 +388,7 @@ fn consume_and_insert(
 
     let mut tx = conn.transaction().map_err(map_db_err)?;
     let mut ops_in_tx = 0usize;
+    let mut tx_since = std::time::Instant::now();
 
     for msg in rx {
         let dir = match msg {
@@ -426,10 +435,12 @@ fn consume_and_insert(
                 dir_files += 1;
             }
 
-            tx.execute(
+            tx.prepare_cached(
                 "INSERT INTO arkos_dirs(snapshot_id, parent_id, path, name, depth, mtime, bytes, files)
                  VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![
+            )
+            .and_then(|mut stmt| {
+                stmt.execute(params![
                     snapshot_id,
                     parent_id,
                     node.path,
@@ -438,8 +449,8 @@ fn consume_and_insert(
                     node.mtime,
                     dir_bytes,
                     dir_files
-                ],
-            )
+                ])
+            })
             .map_err(map_db_err)?;
             let dir_id = tx.last_insert_rowid();
             token_to_id.insert(node.token, dir_id);
@@ -469,10 +480,11 @@ fn consume_and_insert(
                 }
             }
 
-            if ops_in_tx >= BATCH_COMMIT_ENTRIES {
+            if commit_due(ops_in_tx, tx_since) {
                 tx.commit().map_err(map_db_err)?;
                 tx = conn.transaction().map_err(map_db_err)?;
                 ops_in_tx = 0;
+                tx_since = std::time::Instant::now();
             }
         }
     }

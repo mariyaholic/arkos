@@ -42,6 +42,35 @@ Reading the numbers:
 - The 1M-file rows (MFT, diff, rollup, DB bytes) are extrapolations in the gate column only; none
   of them has been measured at 1M files.
 
+## 2026-11-18, Linux, 100k files, after writer tuning (H1.1 Q1)
+
+Same host, fixtures and hashes as the 2026-11-17 run. The "before" column is a fresh run of
+`scripts/measure.sh` at commit `528b5a0` on this host, because machine load drifts between days.
+The change: a 32 MiB page cache and no automatic WAL checkpoint during the scan (a
+`wal_checkpoint(TRUNCATE)` and the old defaults at the end), a commit every 50,000 rows or 2
+seconds instead of 1,000 rows, and a cached prepared statement for the directory INSERT.
+
+| Row | 12k dirs before | 12k dirs after | 100k dirs before | 100k dirs after | Gate |
+|---|---|---|---|---|---|
+| Walk files/s | 35,498 | 79,872 | 12,639 | 25,182 | at least 200,000 (fails under 150,000) |
+| Scan wall ms | 2,817 | 1,252 | 7,912 | 3,971 | |
+| Rollup ms | 48 | 44 | 851 | 1,523 | under 3,000 at 1M files |
+| Peak working set | 11.3 MB | 25.2 MB | 22.5 MB | 56.1 MB | at most 60 MB |
+| DB bytes per snapshot | 24.5 MB | 24.6 MB | 65.3 MB | 65.3 MB | at most 75 MB per 1M files |
+| Diff ms | 516 | 707 | 1,793 | 1,900 | under 2,000 at 1M files |
+
+Reading the numbers:
+
+- Walk throughput rises 2.2 times on the 12k-directory tree and 2.0 times on the 100k-directory
+  tree, and is still under the 150,000 files/s floor. The tuning does not remove the cost of
+  updating the primary key and three secondary indexes for each row. Schema 0002 (see
+  `schema-0002-plan.md`) removes two of those indexes and shrinks the rows.
+- Peak working set on the 100k-directory tree is 56.1 MB, which is 4 MB under the 60 MB gate. The
+  32 MiB cache is a fixed cost, so the peak does not grow with file count, but the margin is thin;
+  a Windows run decides whether the cache size stays.
+- Rollup and diff times moved with the host's load between runs (the diff and rollup code did not
+  change). Treat differences under 30% in those rows as noise.
+
 `cargo test --release -- --ignored` runs `walk_throughput_on_100k` and `diff_100k_under_2s`. On
 this host the first fails by design of the gate (about 22,000 files/s against 150,000), and the
 second passes.

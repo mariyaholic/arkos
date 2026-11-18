@@ -204,6 +204,7 @@ pub fn run_scan_with_progress(
     };
 
     let scan_t0 = Instant::now();
+    crate::db::begin_bulk_write(conn)?;
     let scan_res = match resolved_mode {
         "mft" => mft::mft_into_snapshot(
             conn,
@@ -221,6 +222,7 @@ pub fn run_scan_with_progress(
             },
         ),
     };
+    crate::db::end_bulk_write(conn);
     progress.finish();
     progress.clear_heartbeat();
     let scan_ms = scan_t0.elapsed().as_millis() as u64;
