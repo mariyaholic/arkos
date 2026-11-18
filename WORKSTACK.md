@@ -18,4 +18,4 @@
   - Blockers: walk still under the 150k files/s floor; Windows-only code (identity check, placeholders, long-path test, compare-mft.ps1) is type-checked and unrun
 
 ## Verification
-- (runbook pending)
+- 2026-11-18, Windows build under Wine 11 (MinGW, `CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER=wine`): 91 of 92 tests pass, including `state_machines.rs` and `long_paths_windows.rs`. `case_only_rename_shows_as_one_removed_and_one_added` fails because Wine on a case-sensitive host does not apply a case-only rename (`ren Foo foo` leaves `Foo`); real NTFS is expected to pass. Wine has no NTFS volume, so `mft_windows.rs` stays unrun.
