@@ -36,6 +36,8 @@ pub struct WalkStats {
     pub bytes: u64,
     pub denied: u64,
     pub skipped: u64,
+    /// Cloud placeholder files (recall or offline attribute), counted with their logical size.
+    pub placeholders: u64,
     /// Lossy forms of entries skipped because their names are not valid Unicode (capped).
     pub non_unicode: Vec<String>,
     /// How many entries were skipped for non-Unicode names, including those not listed.
@@ -180,6 +182,7 @@ pub fn walk_into_snapshot(
     let next_token = Arc::new(AtomicU64::new(2));
     let denied = Arc::new(AtomicU64::new(0));
     let skipped = Arc::new(AtomicU64::new(0));
+    let placeholders = Arc::new(AtomicU64::new(0));
     let non_unicode = Arc::new(Mutex::new((0u64, Vec::<String>::new())));
     let (tx, rx) = mpsc::sync_channel::<WriterMsg>(64);
 
@@ -192,11 +195,12 @@ pub fn walk_into_snapshot(
             let nt = Arc::clone(&next_token);
             let den = Arc::clone(&denied);
             let skp = Arc::clone(&skipped);
+            let ph = Arc::clone(&placeholders);
             let nu = Arc::clone(&non_unicode);
             let wtx = tx.clone();
             scope.spawn(move || {
                 while let Some(item) = q.pop() {
-                    process_dir(&item, filter, &q, &nt, &den, &skp, &nu, &wtx);
+                    process_dir(&item, filter, &q, &nt, &den, &skp, &ph, &nu, &wtx);
                     q.finish_one();
                 }
             });
@@ -223,6 +227,7 @@ pub fn walk_into_snapshot(
 
     stats.denied = denied.load(Ordering::Acquire);
     stats.skipped = skipped.load(Ordering::Acquire);
+    stats.placeholders = placeholders.load(Ordering::Acquire);
     {
         let guard = non_unicode.lock().expect("non-unicode list");
         stats.non_unicode_total = guard.0;
@@ -240,6 +245,7 @@ fn process_dir(
     next_token: &AtomicU64,
     denied: &AtomicU64,
     skipped: &AtomicU64,
+    placeholders: &AtomicU64,
     non_unicode: &Mutex<(u64, Vec<String>)>,
     tx: &mpsc::SyncSender<WriterMsg>,
 ) {
@@ -332,7 +338,13 @@ fn process_dir(
             }
         };
 
-        if is_reparse_or_symlink(&meta) {
+        // A cloud placeholder file is a reparse point too, but it is an ordinary file with a
+        // logical size, so it is counted and sized like any other file.
+        let placeholder = !meta.is_dir() && is_placeholder(&meta);
+        if placeholder {
+            placeholders.fetch_add(1, Ordering::Relaxed);
+        }
+        if !placeholder && is_reparse_or_symlink(&meta) {
             // Policy (§5.3): record reparse points as size-0 entries with ext=NULL, never follow.
             files.push(FileEntry {
                 name: entry_name,
@@ -508,6 +520,17 @@ fn modified_epoch(meta: &Metadata) -> Option<i64> {
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_secs() as i64)
+}
+
+#[cfg(windows)]
+fn is_placeholder(meta: &Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    crate::scan::paths::attrs_are_placeholder(meta.file_attributes())
+}
+
+#[cfg(not(windows))]
+fn is_placeholder(_meta: &Metadata) -> bool {
+    false
 }
 
 fn is_reparse_or_symlink(meta: &Metadata) -> bool {

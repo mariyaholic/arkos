@@ -87,6 +87,8 @@ pub struct ScanReport {
     pub bytes: u64,
     pub denied: u64,
     pub skipped: u64,
+    /// Cloud placeholder files, counted with their logical size.
+    pub placeholders: u64,
     pub scan_ms: u64,
     pub rollup_ms: u64,
     pub warning: Option<String>,
@@ -257,6 +259,16 @@ pub fn run_scan_with_progress(
         );
     }
 
+    if stats.placeholders > 0 {
+        logger.event(
+            "cloud_placeholders",
+            &format!(
+                "snapshot={snapshot_id} placeholders={} counted with logical size",
+                stats.placeholders
+            ),
+        );
+    }
+
     let rollup_t0 = Instant::now();
     if let Err(e) = rollup_snapshot(conn, snapshot_id) {
         fail_snapshot(conn, snapshot_id, scan_ms);
@@ -320,8 +332,8 @@ pub fn run_scan_with_progress(
     logger.event(
         "scan_complete",
         &format!(
-            "snapshot={snapshot_id} volume={} mode={ran_mode} files={} dirs={} bytes={} denied={} scan_ms={scan_ms} rollup_ms={rollup_ms}",
-            target.volume, stats.files, stats.dirs, stats.bytes, stats.denied
+            "snapshot={snapshot_id} volume={} mode={ran_mode} files={} dirs={} bytes={} denied={} placeholders={} scan_ms={scan_ms} rollup_ms={rollup_ms}",
+            target.volume, stats.files, stats.dirs, stats.bytes, stats.denied, stats.placeholders
         ),
     );
 
@@ -335,6 +347,7 @@ pub fn run_scan_with_progress(
         bytes: stats.bytes,
         denied: stats.denied,
         skipped: stats.skipped,
+        placeholders: stats.placeholders,
         scan_ms,
         rollup_ms,
         warning,

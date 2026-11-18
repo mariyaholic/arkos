@@ -7,7 +7,9 @@
 use crate::db::map_db_err;
 use crate::exit::{Error, Result};
 use crate::progress::Reporter;
-use crate::scan::paths::{matches_any_exclude, normalize_display_path, normalize_ext};
+use crate::scan::paths::{
+    attrs_are_placeholder, matches_any_exclude, normalize_display_path, normalize_ext,
+};
 use crate::scan::walk::{commit_due, ScanFilter, WalkStats, MAX_LOGGED_NAMES};
 use rusqlite::{params, Connection};
 use std::collections::HashMap;
@@ -512,7 +514,9 @@ fn run(
             stats.skipped += 1;
             return true;
         }
-        let (size, mtime, ext) = if rec.is_reparse() {
+        // A cloud placeholder is a reparse point that is still an ordinary file with a size.
+        let placeholder = attrs_are_placeholder(rec.attrs);
+        let (size, mtime, ext) = if rec.is_reparse() && !placeholder {
             (0, filetime_to_unix(rec.timestamp), None)
         } else {
             match src.stat(rec.frn) {
@@ -534,6 +538,9 @@ fn run(
         if let Err(e) = write {
             db_err = Some(e);
             return false;
+        }
+        if placeholder {
+            stats.placeholders += 1;
         }
         let t = totals.entry(dir_id).or_insert((0, 0));
         t.0 += size;
@@ -798,6 +805,46 @@ mod tests {
         let line = diag.to_string();
         assert!(line.contains("orphan_parent_frns=[0x63]"), "{line}");
         assert!(line.contains("usn_seen=10..30"), "{line}");
+    }
+
+    #[test]
+    fn a_cloud_placeholder_keeps_its_logical_size_and_is_counted() {
+        let (conn, id) = setup();
+        let file = 0x20;
+        let src = Fake {
+            records: vec![
+                rec(10, ROOT, 0x10, "docs"),
+                // Reparse point with RECALL_ON_DATA_ACCESS: a OneDrive style placeholder.
+                rec(20, 10, file | 0x400 | 0x40_0000, "online.docx"),
+                // A plain reparse point is still a size-0 entry.
+                rec(21, 10, file | 0x400, "link.lnk"),
+            ],
+            sizes: HashMap::from([(20, 4096), (21, 77)]),
+        };
+        let out = scan_with_source(
+            &conn,
+            id,
+            Path::new("C:\\"),
+            ROOT,
+            &src,
+            ScanFilter::default(),
+            &mut Reporter::off(),
+            DIR_LIMIT,
+        )
+        .unwrap();
+        let UsnScan::Done(done) = out else {
+            panic!("expected a finished scan");
+        };
+        let (stats, _) = *done;
+        assert_eq!((stats.files, stats.bytes, stats.placeholders), (2, 4096, 1));
+        let ext: Option<String> = conn
+            .query_row(
+                "SELECT ext FROM arkos_files WHERE name = 'online.docx'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ext.as_deref(), Some("docx"));
     }
 
     #[test]

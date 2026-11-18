@@ -92,6 +92,14 @@ has not progressed for over 120 seconds, the error says it looks stalled and sug
 process; Arkos does not end it for you. `arkos status` lists each running scan as `running` or
 `stalled (N s)`.
 
+## Cloud placeholders and long paths
+
+Files that a cloud provider keeps online (OneDrive and similar) carry a recall or offline
+attribute. The scan counts them as `placeholders` in the text and JSON output and in the log, and
+records their logical size like any other file, so a placeholder adds its full size to the totals
+although it may use no disk space. Arkos never opens a placeholder for reading, so it does not
+download one. On Windows the walk reaches paths longer than 260 characters.
+
 ## What `denied` means
 
 `denied` counts folders or files that Arkos could not read, usually for lack of permission. They

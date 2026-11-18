@@ -207,6 +207,10 @@ mod win {
     }
 
     /// File reference number of the volume root directory, as USN records report it.
+    ///
+    /// `root` is a volume root such as `X:\` (`volume_root_letter` allows nothing longer), so
+    /// this call needs no `\\?\` prefix. The other handle calls use the `\\.\X:` device path or
+    /// a file ID, and never a long path.
     pub fn root_frn(root: &Path) -> io::Result<u64> {
         let path = wide(&root.to_string_lossy());
         let handle = unsafe {

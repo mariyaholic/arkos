@@ -22,6 +22,19 @@ pub fn to_os_open_path(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
+/// `FILE_ATTRIBUTE_OFFLINE`: the data is not available locally.
+const ATTR_OFFLINE: u32 = 0x0000_1000;
+/// `FILE_ATTRIBUTE_RECALL_ON_OPEN`: opening the file brings the data back.
+const ATTR_RECALL_ON_OPEN: u32 = 0x0004_0000;
+/// `FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS`: reading the data brings it back (cloud placeholders).
+const ATTR_RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
+
+/// True when Windows file attributes mark a cloud placeholder: a file whose data lives online.
+/// Its logical size is still reported, so the scan counts the file and keeps that size.
+pub fn attrs_are_placeholder(attrs: u32) -> bool {
+    attrs & (ATTR_OFFLINE | ATTR_RECALL_ON_OPEN | ATTR_RECALL_ON_DATA_ACCESS) != 0
+}
+
 /// Strip Windows `\\?\` display prefix so stored `arkos_dirs.path` stays human-readable.
 pub fn normalize_display_path(path: &Path) -> String {
     let raw = path.to_string_lossy();
@@ -107,6 +120,15 @@ fn glob_match_ci(pattern: &str, text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn placeholder_attributes_are_recognised() {
+        assert!(attrs_are_placeholder(0x0040_0000)); // RECALL_ON_DATA_ACCESS
+        assert!(attrs_are_placeholder(0x0004_0000 | 0x20)); // RECALL_ON_OPEN, archive
+        assert!(attrs_are_placeholder(0x1000)); // OFFLINE
+        assert!(!attrs_are_placeholder(0x20)); // archive only
+        assert!(!attrs_are_placeholder(0x400 | 0x10)); // reparse directory
+    }
 
     #[test]
     fn ext_normalizes_lowercase_and_ignores_dotfiles() {

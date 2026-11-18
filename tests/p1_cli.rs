@@ -226,3 +226,19 @@ fn mode_mft_needs_the_experimental_flag() {
         assert_eq!(out.status.code(), Some(5), "{err}");
     }
 }
+
+#[test]
+fn scan_output_reports_placeholders() {
+    let env = Env::new("placeholders");
+    let tree = env.root.join("tree");
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::write(tree.join("a"), b"1").unwrap();
+    let vol = tree.to_string_lossy().into_owned();
+
+    let json = arkos(&env.paths.home, &["scan", "--volume", &vol, "--json"]);
+    let text = String::from_utf8_lossy(&json.stdout);
+    assert!(text.contains("\"placeholders\": 0"), "{text}");
+    let plain = arkos(&env.paths.home, &["scan", "--volume", &vol]);
+    let text = String::from_utf8_lossy(&plain.stdout);
+    assert!(text.contains("placeholders=0"), "{text}");
+}

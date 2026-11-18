@@ -250,6 +250,7 @@ fn try_run() -> Result<Exit> {
                     report.scan_ms,
                     report.rollup_ms
                 );
+                println!("placeholders={}", report.placeholders);
                 if let Some(w) = report.warning {
                     println!("warning: {w}");
                 }
