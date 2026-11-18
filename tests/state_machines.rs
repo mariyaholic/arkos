@@ -604,3 +604,84 @@ fn a_scan_that_abandons_a_dead_row_stamps_finished_at() {
     let log = std::fs::read_to_string(env.paths.logs.join("arkos.log")).unwrap();
     assert!(log.contains("abandoned_dead_scan"), "{log}");
 }
+
+// ---------------------------------------------------------------------------------------------
+// S-10: heartbeat sidecar
+// ---------------------------------------------------------------------------------------------
+
+fn write_beat(lock_path: &std::path::Path, beat: i64) {
+    let hb = arkos::lock::heartbeat_path(lock_path);
+    let line = format!("pid=4242 started={} beat={beat} files=7\n", beat - 5);
+    std::fs::write(hb, line).unwrap();
+}
+
+#[test]
+fn s10_the_sidecar_exists_while_the_lock_is_held_and_goes_with_it() {
+    let env = Env::new("s10a");
+    let held = VolumeLock::acquire(&env.paths.locks, "dir:/hb", 200).unwrap();
+    let info = arkos::lock::read_heartbeat(&held.path).expect("sidecar readable");
+    assert_eq!(info.pid, std::process::id());
+    assert!(info.stalled_for(now()).is_none());
+    let hb = arkos::lock::heartbeat_path(&held.path);
+    assert!(hb.exists());
+    drop(held);
+    assert!(!hb.exists());
+}
+
+#[test]
+fn s10_a_partial_or_missing_sidecar_reads_as_unknown() {
+    let env = Env::new("s10b");
+    let held = VolumeLock::acquire(&env.paths.locks, "dir:/hb", 200).unwrap();
+    let hb = arkos::lock::heartbeat_path(&held.path);
+    std::fs::write(&hb, "pid=12 sta").unwrap();
+    assert!(arkos::lock::read_heartbeat(&held.path).is_none());
+    std::fs::remove_file(&hb).unwrap();
+    assert!(arkos::lock::read_heartbeat(&held.path).is_none());
+}
+
+#[test]
+fn s10_busy_names_the_pid_and_reports_a_stall() {
+    let env = Env::new("s10c");
+    let held = VolumeLock::acquire(&env.paths.locks, "dir:/hb", 200).unwrap();
+    let fresh = VolumeLock::acquire(&env.paths.locks, "dir:/hb", 50).unwrap_err();
+    let msg = fresh.to_string();
+    assert!(
+        msg.contains(&format!("pid {}", std::process::id())),
+        "{msg}"
+    );
+    assert!(!msg.contains("stalled"), "{msg}");
+
+    write_beat(&held.path, now() - 300);
+    let stale = VolumeLock::acquire(&env.paths.locks, "dir:/hb", 50).unwrap_err();
+    let msg = stale.to_string();
+    assert!(msg.contains("pid 4242"), "{msg}");
+    assert!(msg.contains("stalled"), "{msg}");
+    assert_eq!(stale.exit(), arkos::exit::Exit::Busy);
+}
+
+#[test]
+fn s10_status_lists_a_running_scan_as_running_or_stalled() {
+    let env = Env::new("s10d");
+    let volume = "dir:/hb";
+    insert_snap(&env.conn, volume, "r", "running", now());
+    let held = VolumeLock::acquire(&env.paths.locks, volume, 200).unwrap();
+    let rows = arkos::probe::running_scans(&env.conn, &env.paths.locks).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].health, "running");
+
+    write_beat(&held.path, now() - 300);
+    let rows = arkos::probe::running_scans(&env.conn, &env.paths.locks).unwrap();
+    assert!(
+        rows[0].health.starts_with("stalled ("),
+        "{}",
+        rows[0].health
+    );
+
+    // A stale sidecar next to a free lock is ignored, and so is the dead scan's row.
+    let lock_path = held.path.clone();
+    drop(held);
+    write_beat(&lock_path, now() - 300);
+    assert!(arkos::probe::running_scans(&env.conn, &env.paths.locks)
+        .unwrap()
+        .is_empty());
+}

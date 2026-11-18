@@ -135,7 +135,8 @@ pub fn run_scan_with_progress(
     progress: &mut Reporter,
 ) -> Result<ScanReport> {
     let target = resolve_target(volume_arg, subpath)?;
-    let _lock = VolumeLock::acquire(&paths.locks, &target.volume, config.busy_timeout_ms)?;
+    let lock = VolumeLock::acquire(&paths.locks, &target.volume, config.busy_timeout_ms)?;
+    progress.set_heartbeat(lock.heartbeat());
 
     // Holding the volume lock proves no live scan owns this volume, so any `running` row for it
     // belongs to a dead scan (for example one that died after this process swept at open).
@@ -221,6 +222,7 @@ pub fn run_scan_with_progress(
         ),
     };
     progress.finish();
+    progress.clear_heartbeat();
     let scan_ms = scan_t0.elapsed().as_millis() as u64;
 
     let ScanOutcome {

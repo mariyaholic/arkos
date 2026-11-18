@@ -44,15 +44,7 @@ impl VolumeLock {
                     Ok(true) => break,
                     Ok(false) => {
                         if Instant::now() >= deadline {
-                            let holder = std::fs::read_to_string(&path).unwrap_or_default();
-                            let suffix = if holder.trim().is_empty() {
-                                String::new()
-                            } else {
-                                format!(": {}", holder.trim())
-                            };
-                            return Err(Error::Busy(format!(
-                                "volume lock for {volume} is held past {timeout_ms}ms{suffix}"
-                            )));
+                            return Err(Error::Busy(busy_message(&path, volume, timeout_ms)));
                         }
                         std::thread::sleep(Duration::from_millis(25));
                     }
@@ -88,8 +80,139 @@ impl VolumeLock {
         let _ = writeln!(file, "{diag}");
         let _ = file.flush();
 
+        let mut heartbeat = Heartbeat::new(&path);
+        heartbeat.beat_now(0);
         Ok(Self { file, path })
     }
+
+    /// A heartbeat writer for the scan that holds this lock. The sidecar is removed when the
+    /// lock is dropped.
+    pub fn heartbeat(&self) -> Heartbeat {
+        Heartbeat::new(&self.path)
+    }
+}
+
+/// A scan whose last beat is older than this many seconds counts as stalled.
+pub const STALL_SECS: i64 = 120;
+
+/// Smallest gap between two beat writes.
+const BEAT_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Sidecar path `<lock file>.hb` next to a lock file.
+pub fn heartbeat_path(lock_path: &Path) -> PathBuf {
+    let mut name = lock_path.as_os_str().to_owned();
+    name.push(".hb");
+    PathBuf::from(name)
+}
+
+/// What the sidecar says about the scan that holds a lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeartbeatInfo {
+    pub pid: u32,
+    pub started: i64,
+    pub beat: i64,
+    pub files: u64,
+}
+
+impl HeartbeatInfo {
+    /// Seconds since the last beat when that is past [`STALL_SECS`], else `None`.
+    pub fn stalled_for(&self, now: i64) -> Option<i64> {
+        let age = now - self.beat;
+        (age > STALL_SECS).then_some(age)
+    }
+
+    fn parse(text: &str) -> Option<Self> {
+        let (mut pid, mut started, mut beat, mut files) = (None, None, None, None);
+        for part in text.split_whitespace() {
+            let (k, v) = part.split_once('=')?;
+            match k {
+                "pid" => pid = v.parse().ok(),
+                "started" => started = v.parse().ok(),
+                "beat" => beat = v.parse().ok(),
+                "files" => files = v.parse().ok(),
+                _ => {}
+            }
+        }
+        Some(Self {
+            pid: pid?,
+            started: started?,
+            beat: beat?,
+            files: files?,
+        })
+    }
+}
+
+/// Read the sidecar for the lock file at `lock_path`. A missing, partial or unparsable file
+/// reads as `None` ("unknown"). Only trust the result while the lock is held.
+pub fn read_heartbeat(lock_path: &Path) -> Option<HeartbeatInfo> {
+    let text = std::fs::read_to_string(heartbeat_path(lock_path)).ok()?;
+    HeartbeatInfo::parse(&text)
+}
+
+/// Heartbeat for a volume as `status` sees it, from the locks directory.
+pub fn read_heartbeat_for(locks_dir: &Path, volume: &str) -> Option<HeartbeatInfo> {
+    read_heartbeat(&lock_path_for(locks_dir, volume))
+}
+
+/// Writes the sidecar from the scan's own loop, at most every 5 seconds. There is no timer
+/// thread: a thread would keep beating while the walk is stuck.
+#[derive(Debug)]
+pub struct Heartbeat {
+    path: PathBuf,
+    started: i64,
+    last: Option<Instant>,
+}
+
+impl Heartbeat {
+    fn new(lock_path: &Path) -> Self {
+        Self {
+            path: heartbeat_path(lock_path),
+            started: chrono::Utc::now().timestamp(),
+            last: None,
+        }
+    }
+
+    /// Write a beat when 5 seconds have passed since the last one.
+    pub fn beat(&mut self, files: u64) {
+        if let Some(last) = self.last {
+            if last.elapsed() < BEAT_INTERVAL {
+                return;
+            }
+        }
+        self.beat_now(files);
+    }
+
+    fn beat_now(&mut self, files: u64) {
+        self.last = Some(Instant::now());
+        let line = format!(
+            "pid={} started={} beat={} files={}\n",
+            std::process::id(),
+            self.started,
+            chrono::Utc::now().timestamp(),
+            files
+        );
+        // Rewritten in place; a reader that catches it half written treats it as unknown.
+        let _ = std::fs::write(&self.path, line);
+    }
+}
+
+fn busy_message(path: &Path, volume: &str, timeout_ms: u64) -> String {
+    let mut msg = format!("volume lock for {volume} is held past {timeout_ms}ms");
+    if let Some(hb) = read_heartbeat(path) {
+        msg.push_str(&format!(" by pid {}", hb.pid));
+        if let Some(age) = hb.stalled_for(chrono::Utc::now().timestamp()) {
+            msg.push_str(&format!(
+                "; that scan has not progressed for {age}s and looks stalled; end process {} if it is hung",
+                hb.pid
+            ));
+        }
+    } else {
+        let holder = std::fs::read_to_string(path).unwrap_or_default();
+        if !holder.trim().is_empty() {
+            msg.push_str(&format!(": {}", holder.trim()));
+        }
+    }
+    msg
 }
 
 impl VolumeLock {
@@ -124,6 +247,7 @@ impl VolumeLock {
 
 impl Drop for VolumeLock {
     fn drop(&mut self) {
+        let _ = std::fs::remove_file(heartbeat_path(&self.path));
         let _ = unlock_exclusive(&self.file);
     }
 }

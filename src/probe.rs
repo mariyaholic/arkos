@@ -133,6 +133,46 @@ pub fn status_probe_exit_with_locks(
     probe_after_running(conn, running)
 }
 
+/// One `running` snapshot as `arkos status` shows it.
+#[derive(Debug, Serialize)]
+pub struct RunningScan {
+    pub id: i64,
+    pub volume: String,
+    /// `running`, or `stalled (N s)` when the holder's last beat is older than 120 seconds.
+    pub health: String,
+}
+
+/// The `running` snapshots whose volume lock is held, with their heartbeat health. A row whose
+/// lock is free belongs to a dead scan, and a stale sidecar is ignored.
+pub fn running_scans(conn: &Connection, locks_dir: &std::path::Path) -> Result<Vec<RunningScan>> {
+    let now = chrono::Utc::now().timestamp();
+    let mut stmt = conn
+        .prepare("SELECT id, volume FROM arkos_snapshots WHERE state = 'running' ORDER BY id")
+        .map_err(map_db_err)?;
+    let rows: Vec<(i64, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .map_err(map_db_err)?
+        .collect::<std::result::Result<_, _>>()
+        .map_err(map_db_err)?;
+    let mut out = Vec::new();
+    for (id, volume) in rows {
+        if matches!(
+            crate::lock::VolumeLock::is_free(locks_dir, &volume),
+            Ok(true)
+        ) {
+            continue;
+        }
+        let health = match crate::lock::read_heartbeat_for(locks_dir, &volume)
+            .and_then(|hb| hb.stalled_for(now))
+        {
+            Some(age) => format!("stalled ({age} s)"),
+            None => "running".to_owned(),
+        };
+        out.push(RunningScan { id, volume, health });
+    }
+    Ok(out)
+}
+
 fn probe_after_running(conn: &Connection, running: bool) -> Result<Exit> {
     if running {
         return Ok(Exit::Busy);

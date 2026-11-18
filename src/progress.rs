@@ -16,6 +16,7 @@ pub struct Reporter {
     printed: bool,
     /// Width of the line on screen, so the next line or the clear can overwrite all of it.
     width: usize,
+    heartbeat: Option<crate::lock::Heartbeat>,
 }
 
 impl Reporter {
@@ -27,6 +28,7 @@ impl Reporter {
             last: None,
             printed: false,
             width: 0,
+            heartbeat: None,
         }
     }
 
@@ -47,11 +49,25 @@ impl Reporter {
             last: None,
             printed: false,
             width: 0,
+            heartbeat: None,
         }
+    }
+
+    /// Beat the scan's lock sidecar from every tick.
+    pub fn set_heartbeat(&mut self, heartbeat: crate::lock::Heartbeat) {
+        self.heartbeat = Some(heartbeat);
+    }
+
+    /// Stop beating, once the scan no longer holds its lock.
+    pub fn clear_heartbeat(&mut self) {
+        self.heartbeat = None;
     }
 
     /// Report current totals; prints only when the interval has passed since the last line.
     pub fn tick(&mut self, files: u64, dirs: u64, bytes: u64) {
+        if let Some(hb) = self.heartbeat.as_mut() {
+            hb.beat(files);
+        }
         if self.sink.is_none() {
             return;
         }

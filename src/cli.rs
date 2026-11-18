@@ -7,7 +7,7 @@ use crate::exit::{Error, Exit, Result};
 use crate::fmt::{format_delta, format_size};
 use crate::logging::Logger;
 use crate::paths::{PathEnvironment, Paths};
-use crate::probe::{build_probe_doc, status_probe_exit_with_locks};
+use crate::probe::{build_probe_doc, running_scans, status_probe_exit_with_locks};
 use crate::progress::Reporter;
 use crate::scan::{run_scan_with_progress, ScanMode};
 use crate::top::{query_top, TopBy};
@@ -411,12 +411,13 @@ fn try_run() -> Result<Exit> {
             }
         }
         Command::Status { probe, json } => {
-            let (code, info) = match db::open_read(&paths.db, config.busy_timeout_ms)? {
+            let (code, info, running) = match db::open_read(&paths.db, config.busy_timeout_ms)? {
                 Some(conn) => (
                     status_probe_exit_with_locks(&conn, &paths.locks)?,
                     db::info(&conn)?,
+                    running_scans(&conn, &paths.locks)?,
                 ),
-                None => (Exit::Ok, db::info(&empty_ledger()?)?),
+                None => (Exit::Ok, db::info(&empty_ledger()?)?, Vec::new()),
             };
             if probe && !json {
                 println!("probe={}", code.code());
@@ -426,6 +427,7 @@ fn try_run() -> Result<Exit> {
                     serde_json::to_string_pretty(&serde_json::json!({
                         "probe_exit": code.code(),
                         "db": info,
+                        "running": running,
                     }))
                     .map_err(|e| Error::Cli(e.to_string()))?
                 );
@@ -438,6 +440,9 @@ fn try_run() -> Result<Exit> {
                     info.counts.get("arkos_files").copied().unwrap_or(0),
                     code.code(),
                 );
+                for r in &running {
+                    println!("scan #{} {} {}", r.id, r.volume, r.health);
+                }
             }
             if probe {
                 Ok(code)
