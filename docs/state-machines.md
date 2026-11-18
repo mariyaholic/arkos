@@ -44,18 +44,25 @@ old behaviour, the fix is:
   directory map passes the limit. Only `--mode auto` falls back to the walk. Windows only, so
   unexecuted here.
 
-## Deferred
+## Fixed in H1.1
+
+| ID | Fix |
+|---|---|
+| SM-4 | After `try_lock` succeeds, `acquire` compares the open handle with the file now at the path (Unix `(dev, ino)`, Windows volume serial and file index) and retries up to 5 times before failing Busy. A waiter that locked an unlinked inode no longer counts as a holder. Test: `sm4_a_waiter_that_locked_an_unlinked_file_retries_on_the_new_one`. The case the original test described, a scan that starts after the lock file was unlinked, still gets a new file and a free lock: no check of the path can see a holder of an unlinked inode, and `is_free` still reports a missing file as free. That case needs someone to delete a lock file during a scan and is left as it is. |
+| S-10 | A scan writes `<lock file>.hb` (`pid`, `started`, `beat`, `files`) from its batch loop at most every 5 seconds, with no timer thread. The Busy error names the pid and, past 120 seconds without a beat, says the scan looks stalled. `arkos status` lists each running scan as `running` or `stalled (N s)`. The lock itself is never broken. Tests: the `s10_*` tests in `tests/state_machines.rs`. |
+
+## Accepted (won't fix)
+
+Decision 6 of H1.1 (owner, 2026-11-18).
 
 | ID | Reason |
 |---|---|
-| SM-4 | Needs a deliberate unlink of the lock file; a fix needs an inode recheck loop after locking. Its test stays `#[ignore]`. |
 | S-2 | Predicted mode on failed and abandoned rows shows only on Windows and is cosmetic. |
 | S-4 | A race of microseconds with no deterministic seam; only matters with `busy_timeout_ms = 0`. |
-| S-5 | Needs `AUTOINCREMENT`, which is a schema change and schema 0001 is frozen. |
-| S-6 | The spec requires refusing a newer `user_version`. |
+| S-5 | Needs `AUTOINCREMENT`, which is a schema change and schema 0001 is frozen. Schema 0002 can add it (`schema-0002-plan.md`). |
+| S-6 | The spec requires refusing a newer `user_version`. The migration number collision with DupliCut is an open item in `schema-0002-plan.md`. |
 | S-7 | Needs a long cascade delete; not deterministic in a test. |
 | S-9 | Cosmetic: abandoned `finished_at` is the sweep time. |
-| S-10 | Needs a hung process and a heartbeat design. |
 
 ## 1. Snapshot lifecycle (`arkos_snapshots.state`)
 
@@ -87,7 +94,7 @@ stateDiagram-v2
 | abandoned | complete | the original scan was still alive and finishes | `scan/mod.rs:240` | none | Reachable only if a sweep misjudged a live scan (see SM-2 and SM-4) |
 
 Terminal states: `complete`, `failed` and `abandoned` have no outgoing transition except deletion.
-`running` never leaves while its owner is alive and hung, because there is no heartbeat (S-10).
+`running` never leaves while its owner is alive and hung. The heartbeat sidecar reports such a scan as stalled in `arkos status` and in the Busy error, and does not end it (S-10).
 
 What each consumer accepts:
 
@@ -149,7 +156,7 @@ Platform differences:
 |---|---|---|
 | Scope | whole file, advisory, per open file description | one byte at offset 0x4000_0000, per handle |
 | Same-process second open | conflicts | conflicts |
-| Unlinking the held file | allowed; a new `acquire` creates a new inode and also succeeds (SM-4) | refused by the OS while the handle is open |
+| Unlinking the held file | allowed; a new `acquire` creates a new inode and also succeeds, but a waiter that already locked the old inode notices and retries (SM-4) | refused by the OS while the handle is open |
 | Release on death | immediate | immediate, after the kernel closes the handle |
 | Case folding | the key is upper-cased, so `dir:/data/A` and `dir:/data/a` collide (SM-5) | matches the filesystem, which is case-insensitive |
 
@@ -322,14 +329,14 @@ consoles that have not enabled virtual terminal processing print that sequence l
 
 ## Defects reproduced by a failing test
 
-Run `cargo test --test state_machines -- --ignored`. Thirteen tests failed when written; only SM-4 is still `#[ignore]` (see Deferred).
+Run `cargo test --test state_machines -- --ignored`. Thirteen tests failed when written; all of them pass now, and none is `#[ignore]`.
 
 | ID | Severity | Where | Summary | Test |
 |---|---|---|---|---|
 | SM-1 | low | `scan/mod.rs:140-152` | A scan holds the volume lock, so any `running` row for that volume is dead, yet it is refused (exit 4) instead of swept. The sweep ran earlier, at open | `sm1_scan_abandons_a_dead_running_row_it_finds_under_its_own_lock` |
 | SM-2 | medium | `scan/mod.rs:240-262` | The completion UPDATE has no state guard and its row count is ignored. A scan whose row was swept and pruned reports success for a snapshot that is gone | `sm2_scan_does_not_report_success_for_a_snapshot_that_vanished` |
 | SM-3 | medium | `db/mod.rs:76-85`, `cli.rs:249` and others | Read verbs open writable and take `BEGIN IMMEDIATE`, so they queue behind a scan's write transaction and fail with Busy | `sm3_a_read_verb_can_open_the_ledger_while_a_scan_is_writing` |
-| SM-4 | low (Unix) | `lock.rs:24-33, 86` | Unlinking a held lock file lets a second `acquire` succeed, and `is_free` reports a missing file as free, so the sweep can abandon a live scan | `sm4_unlinking_the_lock_file_does_not_admit_a_second_holder` |
+| SM-4 | low (Unix) | `lock.rs:24-33, 86` | Unlinking a held lock file lets a second `acquire` succeed, and `is_free` reports a missing file as free, so the sweep can abandon a live scan | `sm4_a_waiter_that_locked_an_unlinked_file_retries_on_the_new_one` (fixed in H1.1, see above) |
 | SM-5 | low (Unix) | `lock.rs:116` | The lock key is upper-cased, so `/data/A` and `/data/a` share a lock although their volume keys differ | `sm5_case_distinct_directories_have_distinct_locks` |
 | SM-6 | medium | `volumes.rs:71-75` | The `dir:` volume key is the raw argument: a trailing separator, a relative path or a symlink gives a second key for one tree, splitting the lock, the one-running rule, diff and prune partitions. A relative key names a different tree per working directory | `sm6a_...`, `sm6b_dir_volume_key_is_absolute` |
 | SM-7 | medium | `diff.rs:78-82` | `diff` compares volumes but not roots, so a subtree snapshot diffs against a full one and reports the rest of the tree as removed | `sm7_diff_refuses_snapshots_of_different_roots` |
@@ -352,7 +359,7 @@ Run `cargo test --test state_machines -- --ignored`. Thirteen tests failed when 
 | S-7 | `scan/walk.rs:381`, `retention.rs:370` | A prune cascade that holds the write lock for over `busy_timeout_ms` fails the scan's next commit; `fail_snapshot` may fail too and leave `running` until the next sweep | Needs a long cascade delete, not deterministic in a unit test |
 | S-8 | `scan/mft.rs:79-111` | `--mode mft` falls back to the walk with only a log note when the volume cannot be opened or the root is a subtree | Windows only; the architecture note accepts it |
 | S-9 | `retention.rs:266` | `abandoned` rows get `finished_at` = sweep time, so the stored duration can span days | Cosmetic |
-| S-10 | `lock.rs` | A live but hung scan holds `running` forever; there is no heartbeat or age limit when the lock probe works | Needs a hung process |
+| S-10 | `lock.rs` | A live but hung scan holds `running` forever | Fixed in H1.1 by the heartbeat sidecar |
 
 Dead code: `sweep_abandoned` and `sweep_abandoned_at` (`retention.rs:207-235`) are public and unused;
 the 24 h rule now lives inside `sweep_abandoned_with_locks`.

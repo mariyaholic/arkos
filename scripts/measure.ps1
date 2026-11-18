@@ -117,7 +117,7 @@ try {
     Write-Host ("scan wall ms        {0}" -f [int]$medScan)
     Write-Host "rollup ms           $rollup   (gate < 3000 at 1M files)"
     Write-Host ("peak working set    {0} B   (gate <= 60000000)" -f [int64](Get-Median $peaks))
-    Write-Host ("db bytes/snapshot   {0}   (gate <= 75000000 at 1M files)" -f [int64]($info.db_bytes / 2))
+    Write-Host ("db bytes/snapshot   {0}   (gate <= 75000000 at 1M files)" -f [int64]($info.db_bytes / $info.counts.arkos_snapshots))
     Write-Host ("diff ms             {0}   (gate < 2000 at 1M files)" -f [int](Get-Median $diff))
     Write-Host ("tree ms             {0}   (gate < 4000 at 100k dirs)" -f [int](Get-Median $treeMs))
     Write-Host "tree output bytes   $treeBytes   (gate < 40000000)"

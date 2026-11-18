@@ -85,6 +85,7 @@ done
 
 db_bytes=$("$BIN" db info --json | sed -n 's/.*"db_bytes": \([0-9]*\).*/\1/p')
 wal_bytes=$("$BIN" db info --json | sed -n 's/.*"wal_bytes": \([0-9]*\).*/\1/p')
+snapshots=$("$BIN" db info --json | sed -n 's/.*"arkos_snapshots": \([0-9]*\).*/\1/p')
 bin_bytes=$(stat -c %s "$BIN")
 
 med_scan=$(printf '%s\n' "${scan_ms[@]}" | median)
@@ -101,7 +102,7 @@ echo "walk files/s        $rate   (gate >= 200000, fails < 150000)"
 echo "scan wall ms        $med_scan"
 echo "rollup ms           $rollup_ms   (gate < 3000 at 1M files)"
 echo "peak working set    $((med_peak * 1024)) B   (gate <= 60000000)"
-echo "db bytes/snapshot   $((db_bytes / 2))   (two snapshots in $db_bytes, wal $wal_bytes; gate <= 75000000 at 1M files)"
+echo "db bytes/snapshot   $((db_bytes / snapshots))   ($snapshots snapshots in $db_bytes, wal $wal_bytes; gate <= 75000000 at 1M files)"
 echo "diff ms             $med_diff   (gate < 2000 at 1M files)"
 echo "tree ms             $med_tree   (gate < 4000 at 100k dirs)"
 echo "tree output bytes   $tree_bytes   (gate < 40000000)"

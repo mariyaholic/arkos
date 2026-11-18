@@ -9,5 +9,13 @@
   - Verify: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` (Rust 1.100, also `--target x86_64-pc-windows-gnu`), `cargo test --all-targets`, `cargo test --no-default-features --all-targets`
   - Blockers: MFT reader never executed (needs elevated NTFS); walk 41k files/s on Linux vs 150k gate; DB 245 B/file vs 75 B gate needs a schema change
 
+- **Arkos H1.1** (same branch)
+  - From→To: claude.impl → claude.review (Opus)
+  - Done: Q1 writer tuning (walk 35k to 80k files/s on Linux), Q2 lock identity check, Q3 heartbeat sidecar, Q4 `--experimental` MFT gate plus `scripts/compare-mft.ps1` and prerelease rule, Q5 placeholders and long-path test, Q6 `docs/schema-0002-plan.md`, deferred items updated
+  - Next: review; Windows hand test of the MFT reader on a USB stick or VHD; owner decision on the 0002 migration number (DupliCut holds 0002 in spec section 4.2)
+  - Files: `docs/h1-1.md`, `docs/schema-0002-plan.md`, `docs/measurements.md`, `docs/state-machines.md`, `src/lock.rs`, `src/scan/`, `src/db/mod.rs`, `scripts/`
+  - Verify: the four checks above plus the Windows clippy target
+  - Blockers: walk still under the 150k files/s floor; Windows-only code (identity check, placeholders, long-path test, compare-mft.ps1) is type-checked and unrun
+
 ## Verification
 - (runbook pending)

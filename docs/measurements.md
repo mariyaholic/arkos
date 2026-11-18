@@ -35,7 +35,10 @@ Reading the numbers:
   not the Windows target, so the result is a pointer and not a verdict, but a Windows run should
   expect to look at the writer first.
 - DB bytes per snapshot scale to about 245 bytes per file on the 12k-directory tree. At 1M files
-  that is above the 75 MB gate. The second fixture has one directory per file, which inflates the
+  that is above the 75 MB gate. (Correction, 2026-11-18: the script divided by 2 while the ledger
+  held 3 snapshots, so the DB rows in every table here are 1.5 times too high. The corrected
+  figure is about 160 bytes per file, and 435 on the 100k-directory tree; see
+  `schema-0002-plan.md`. Both scripts now divide by the snapshot count.) The second fixture has one directory per file, which inflates the
   directory rows; its 654 bytes per file is an upper bound for the shape, not a typical tree.
 - Tree and `list` are well inside their gates. The tree output is small because the size floor
   drops rectangles under 4 by 4 units.
