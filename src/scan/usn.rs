@@ -34,6 +34,8 @@ pub fn filetime_to_unix(ft: u64) -> i64 {
 pub struct UsnRecord {
     pub frn: u64,
     pub parent: u64,
+    /// Update sequence number of the record.
+    pub usn: i64,
     pub attrs: u32,
     /// USN record time as a FILETIME. This is the time of the last change, not of the last write.
     pub timestamp: u64,
@@ -103,6 +105,7 @@ pub fn parse_usn_buffer(
                 let keep_going = f(UsnRecord {
                     frn: u64_at(buf, off + 8),
                     parent: u64_at(buf, off + 16),
+                    usn: u64_at(buf, off + 24) as i64,
                     attrs: u32_at(buf, off + 52),
                     timestamp: u64_at(buf, off + 32),
                     name,
@@ -136,9 +139,64 @@ pub trait UsnSource {
 /// Result of an MFT scan attempt.
 #[derive(Debug)]
 pub enum UsnScan {
-    Done(WalkStats),
+    Done(Box<(WalkStats, MftDiag)>),
     /// The directory map passed the limit; nothing was written and the caller should walk.
     TooManyDirs,
+}
+
+/// What the MFT reader saw, for the scan log of an experimental run.
+#[derive(Debug, Default, Clone)]
+pub struct MftDiag {
+    /// Lowest and highest USN among the records seen in phase 1, with the range asked for.
+    pub usn_min: Option<i64>,
+    pub usn_max: Option<i64>,
+    pub records_phase1: u64,
+    pub records_phase2: u64,
+    pub dirs: u64,
+    /// Directories whose parent chain does not reach the root, and a sample of the parent FRNs.
+    pub orphan_dirs: u64,
+    pub orphan_parents: Vec<u64>,
+    /// Files whose parent directory did not exist after phase 1.
+    pub late_files: u64,
+    pub phase1_ms: u64,
+    pub resolve_ms: u64,
+    pub dirs_ms: u64,
+    pub phase2_ms: u64,
+    pub finalize_ms: u64,
+}
+
+/// Most orphan parent FRNs kept for the log.
+const MAX_ORPHAN_SAMPLE: usize = 10;
+
+impl std::fmt::Display for MftDiag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let usn = match (self.usn_min, self.usn_max) {
+            (Some(lo), Some(hi)) => format!("{lo}..{hi}"),
+            _ => "none".to_owned(),
+        };
+        let orphans: Vec<String> = self
+            .orphan_parents
+            .iter()
+            .map(|p| format!("{p:#x}"))
+            .collect();
+        write!(
+            f,
+            "mft_diag usn_seen={usn} usn_asked=0..max records_phase1={} records_phase2={} dirs={} \
+             orphan_dirs={} orphan_parent_frns=[{}] late_files={} phase1_ms={} resolve_ms={} \
+             dirs_ms={} phase2_ms={} finalize_ms={}",
+            self.records_phase1,
+            self.records_phase2,
+            self.dirs,
+            self.orphan_dirs,
+            orphans.join(","),
+            self.late_files,
+            self.phase1_ms,
+            self.resolve_ms,
+            self.dirs_ms,
+            self.phase2_ms,
+            self.finalize_ms
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -271,7 +329,12 @@ fn run(
     let mut nodes: HashMap<u64, DirNode> = HashMap::new();
     let mut bad_names: Vec<(u64, u64, String)> = Vec::new();
     let mut too_many = false;
+    let mut diag = MftDiag::default();
+    let t_phase1 = std::time::Instant::now();
     src.enumerate(&mut |rec| {
+        diag.records_phase1 += 1;
+        diag.usn_min = Some(diag.usn_min.map_or(rec.usn, |m| m.min(rec.usn)));
+        diag.usn_max = Some(diag.usn_max.map_or(rec.usn, |m| m.max(rec.usn)));
         if !rec.is_dir() || rec.frn == root_frn {
             return true;
         }
@@ -295,9 +358,11 @@ fn run(
         !too_many
     })
     .map_err(enum_err)?;
+    diag.phase1_ms = t_phase1.elapsed().as_millis() as u64;
     if too_many {
         return Ok(UsnScan::TooManyDirs);
     }
+    let t_resolve = std::time::Instant::now();
 
     // Resolve every directory to a path, counting each excluded or orphaned directory once.
     let root_display = normalize_display_path(root);
@@ -328,6 +393,10 @@ fn run(
             }
             if !nodes.contains_key(&parent) || chain.len() > nodes.len() {
                 stats.denied += 1; // the top of this chain has no parent we know of
+                diag.orphan_dirs += 1;
+                if diag.orphan_parents.len() < MAX_ORPHAN_SAMPLE {
+                    diag.orphan_parents.push(parent);
+                }
                 break Res::Orphan;
             }
             chain.push(parent);
@@ -361,6 +430,9 @@ fn run(
         note_non_unicode(&mut stats, parent_path, name);
         resolved.insert(*frn, Res::Excluded);
     }
+
+    diag.resolve_ms = t_resolve.elapsed().as_millis() as u64;
+    let t_dirs = std::time::Instant::now();
 
     // Insert directories in depth order so every parent exists before its children.
     let mut dirs: Vec<(u64, &str, i32)> = resolved
@@ -409,10 +481,15 @@ fn run(
         .chain(std::iter::once((root_frn, root_display.as_str())))
         .collect();
 
+    diag.dirs = stats.dirs;
+    diag.dirs_ms = t_dirs.elapsed().as_millis() as u64;
+    let t_phase2 = std::time::Instant::now();
+
     // Phase 2: files.
     let mut totals: HashMap<i64, (i64, i64)> = HashMap::new();
     let mut db_err: Option<Error> = None;
     src.enumerate(&mut |rec| {
+        diag.records_phase2 += 1;
         if rec.frn == root_frn || (rec.is_dir() && !rec.is_reparse()) {
             return true;
         }
@@ -421,6 +498,7 @@ fn run(
             // a directory created after phase 1 and counts as denied.
             if !matches!(resolved.get(&rec.parent), Some(Res::Excluded)) {
                 stats.denied += 1;
+                diag.late_files += 1;
             }
             return true;
         };
@@ -469,6 +547,8 @@ fn run(
     if let Some(e) = db_err {
         return Err(e);
     }
+    diag.phase2_ms = t_phase2.elapsed().as_millis() as u64;
+    let t_finalize = std::time::Instant::now();
 
     for (dir_id, (bytes, files)) in &totals {
         conn.prepare_cached("UPDATE arkos_dirs SET bytes = ?1, files = ?2 WHERE id = ?3")
@@ -477,9 +557,10 @@ fn run(
             .map_err(map_db_err)?;
     }
     batch.commit()?;
+    diag.finalize_ms = t_finalize.elapsed().as_millis() as u64;
 
     stats.non_unicode.sort();
-    Ok(UsnScan::Done(stats))
+    Ok(UsnScan::Done(Box::new((stats, diag))))
 }
 
 #[cfg(test)]
@@ -578,6 +659,7 @@ mod tests {
         UsnRecord {
             frn,
             parent,
+            usn: frn as i64,
             attrs,
             timestamp: 132_000_000_000_000_000,
             name: name.to_owned(),
@@ -652,9 +734,10 @@ mod tests {
     fn two_phase_scan_writes_dirs_files_and_counts() {
         let globs = vec!["node_modules".to_owned(), "*.tmp".to_owned()];
         let (conn, id, out) = run_fake(&globs, DIR_LIMIT);
-        let UsnScan::Done(stats) = out else {
+        let UsnScan::Done(done) = out else {
             panic!("expected a finished scan");
         };
+        let (stats, diag) = *done;
 
         let dirs: Vec<(String, i32, Option<i64>)> = conn
             .prepare("SELECT path, depth, parent_id FROM arkos_dirs WHERE snapshot_id = ?1 ORDER BY depth, path")
@@ -705,6 +788,16 @@ mod tests {
         // skipped: node_modules (once, not its children), the non-Unicode name, and skip.tmp.
         assert_eq!(stats.skipped, 3);
         assert_eq!(stats.non_unicode, vec!["C:\\a\\b\u{fffd}d".to_owned()]);
+
+        assert_eq!(diag.records_phase1, 15);
+        assert_eq!(diag.records_phase2, 15);
+        assert_eq!((diag.usn_min, diag.usn_max), (Some(10), Some(30)));
+        assert_eq!(diag.orphan_dirs, 1);
+        assert_eq!(diag.orphan_parents, vec![99]);
+        assert_eq!(diag.late_files, 2);
+        let line = diag.to_string();
+        assert!(line.contains("orphan_parent_frns=[0x63]"), "{line}");
+        assert!(line.contains("usn_seen=10..30"), "{line}");
     }
 
     #[test]

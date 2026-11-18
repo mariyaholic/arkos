@@ -38,8 +38,11 @@ jobs:
         run: |
           $h = (Get-FileHash arkos.exe -Algorithm SHA256).Hash.ToLower()
           "$h  arkos.exe" | Out-File -Encoding ascii arkos.exe.sha256
+      # A tag with a hyphen (for example v0.2.0-exp.1) is a prerelease and is not marked latest.
       - uses: softprops/action-gh-release@v2
         with:
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          make_latest: ${{ !contains(github.ref_name, '-') }}
           files: |
             arkos.exe
             arkos.exe.sha256

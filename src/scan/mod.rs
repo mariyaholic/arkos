@@ -43,9 +43,10 @@ impl ScanMode {
 
 /// Resolve the requested mode against what the build and the volume offer.
 ///
-/// `auto` picks `mft` only for an elevated token on NTFS in a build with the `mft` feature, and
-/// walks everywhere else (FAT32, exFAT, ReFS, network shares). `mft` fails with exit 5 when the
-/// build or filesystem cannot do it and exit 4 when the token is not elevated.
+/// `auto` always walks: the MFT reader is experimental and only runs on an explicit
+/// `--mode mft --experimental`. `mft` fails with exit 5 when the build or filesystem cannot do it
+/// and exit 4 when the token is not elevated. The CLI refuses `--mode mft` without
+/// `--experimental` before this runs (exit 2).
 pub fn resolve_mode(
     mode: ScanMode,
     built: bool,
@@ -58,11 +59,10 @@ pub fn resolve_mode(
             mft::check_ready(built, ntfs, elevated)?;
             Ok("mft")
         }
-        ScanMode::Auto => Ok(if built && elevated && ntfs {
-            "mft"
-        } else {
-            "walk"
-        }),
+        ScanMode::Auto => {
+            let _ = (built, elevated, ntfs);
+            Ok("walk")
+        }
     }
 }
 
@@ -235,7 +235,10 @@ pub fn run_scan_with_progress(
         Ok(o) => o,
         Err(e) => {
             fail_snapshot(conn, snapshot_id, scan_ms);
-            logger.event("scan_failed", &format!("snapshot={snapshot_id} err={e}"));
+            logger.event(
+                "scan_failed",
+                &format!("snapshot={snapshot_id} err={e}{}", os_error(&e)),
+            );
             return Err(e);
         }
     };
@@ -257,7 +260,10 @@ pub fn run_scan_with_progress(
     let rollup_t0 = Instant::now();
     if let Err(e) = rollup_snapshot(conn, snapshot_id) {
         fail_snapshot(conn, snapshot_id, scan_ms);
-        logger.event("scan_failed", &format!("snapshot={snapshot_id} err={e}"));
+        logger.event(
+            "scan_failed",
+            &format!("snapshot={snapshot_id} err={e}{}", os_error(&e)),
+        );
         return Err(e);
     }
     let rollup_ms = rollup_t0.elapsed().as_millis() as u64;
@@ -288,13 +294,19 @@ pub fn run_scan_with_progress(
             let e = Error::Refused(format!(
                 "snapshot {snapshot_id} left the running state during the scan"
             ));
-            logger.event("scan_failed", &format!("snapshot={snapshot_id} err={e}"));
+            logger.event(
+                "scan_failed",
+                &format!("snapshot={snapshot_id} err={e}{}", os_error(&e)),
+            );
             return Err(e);
         }
         Err(e) => {
             let e = map_db_err(e);
             fail_snapshot(conn, snapshot_id, scan_ms);
-            logger.event("scan_failed", &format!("snapshot={snapshot_id} err={e}"));
+            logger.event(
+                "scan_failed",
+                &format!("snapshot={snapshot_id} err={e}{}", os_error(&e)),
+            );
             return Err(e);
         }
     }
@@ -328,6 +340,17 @@ pub fn run_scan_with_progress(
         warning,
         size_basis: crate::fmt::SIZE_BASIS,
     })
+}
+
+/// ` os_error=<code>` for an I/O error that carries one (the Win32 code on Windows), else empty.
+fn os_error(e: &Error) -> String {
+    match e {
+        Error::Io { source, .. } => source
+            .raw_os_error()
+            .map(|c| format!(" os_error={c}"))
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
 }
 
 /// Directory to leave out when the scan root contains Arkos's own data directory.

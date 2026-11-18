@@ -23,8 +23,8 @@ cargo build --release
 .\target\release\arkos.exe diff --help
 ```
 
-`--mode mft` reads the NTFS master file table and needs an elevated prompt.
-`--mode auto` tries it and falls back to the folder walk.
+`--mode mft --experimental` reads the NTFS master file table, needs an elevated prompt and is
+untested on real volumes; see the user guide before using it. `--mode auto` always walks.
 
 ## Data
 

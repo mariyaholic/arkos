@@ -195,3 +195,34 @@ fn text_output_uses_human_sizes_and_json_keeps_raw_bytes() {
     assert_eq!(v[0]["bytes"], 3 * 1024 * 1024);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn mode_mft_needs_the_experimental_flag() {
+    let env = Env::new("mftflag");
+    let tree = env.root.join("tree");
+    std::fs::create_dir_all(&tree).unwrap();
+    let vol = tree.to_string_lossy().into_owned();
+
+    let out = arkos(
+        &env.paths.home,
+        &["scan", "--volume", &vol, "--mode", "mft"],
+    );
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("--experimental"), "{err}");
+    // A refused flag combination must not create a snapshot.
+    let list = arkos(&env.paths.home, &["list", "--json"]);
+    assert_eq!(String::from_utf8_lossy(&list.stdout).trim(), "[]");
+
+    // With the flag the request gets past the gate, prints the warning, and then fails for the
+    // platform: this build cannot read the MFT here (exit 5, unsupported).
+    let out = arkos(
+        &env.paths.home,
+        &["scan", "--volume", &vol, "--mode", "mft", "--experimental"],
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("experimental and untested"), "{err}");
+    if !cfg!(windows) {
+        assert_eq!(out.status.code(), Some(5), "{err}");
+    }
+}

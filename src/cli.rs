@@ -41,6 +41,9 @@ enum Command {
         label: Option<String>,
         #[arg(long, value_enum, default_value_t = ScanMode::Auto)]
         mode: ScanMode,
+        /// Allow `--mode mft`, the NTFS MFT reader, which is experimental and untested.
+        #[arg(long)]
+        experimental: bool,
         #[arg(long = "exclude")]
         excludes: Vec<String>,
         #[arg(long)]
@@ -201,9 +204,21 @@ fn try_run() -> Result<Exit> {
             path,
             label,
             mode,
+            experimental,
             excludes,
             json,
         } => {
+            if mode == ScanMode::Mft {
+                if !experimental {
+                    return Err(Error::Cli(
+                        "--mode mft is experimental; pass --experimental to use it, or use --mode walk"
+                            .into(),
+                    ));
+                }
+                eprintln!(
+                    "note: the MFT reader is experimental and untested; compare it with --mode walk (scripts/compare-mft.ps1)"
+                );
+            }
             let mut conn = db::open_and_migrate(&paths.db, &paths.locks, config.busy_timeout_ms)?;
             let mut progress = Reporter::auto(json);
             let report = run_scan_with_progress(

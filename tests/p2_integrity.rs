@@ -236,8 +236,8 @@ fn case_only_rename_shows_as_one_removed_and_one_added() {
 fn mode_resolution_table() {
     // (mode, built, elevated, ntfs) -> Ok(mode) or exit code
     let ok = |m, b, e, n| resolve_mode(m, b, e, n).map_err(|e| e.exit());
-    // auto: mft only when everything lines up, walk otherwise (FAT32/exFAT/ReFS are not NTFS).
-    assert_eq!(ok(ScanMode::Auto, true, true, true), Ok("mft"));
+    // auto never picks mft while the reader is experimental.
+    assert_eq!(ok(ScanMode::Auto, true, true, true), Ok("walk"));
     assert_eq!(ok(ScanMode::Auto, true, true, false), Ok("walk"));
     assert_eq!(ok(ScanMode::Auto, true, false, true), Ok("walk"));
     assert_eq!(ok(ScanMode::Auto, false, true, true), Ok("walk"));

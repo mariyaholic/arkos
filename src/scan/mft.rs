@@ -100,11 +100,12 @@ pub fn mft_into_snapshot(
                             progress,
                             DIR_LIMIT,
                         )? {
-                            UsnScan::Done(stats) => {
+                            UsnScan::Done(done) => {
+                                let (stats, diag) = *done;
                                 return Ok(ScanOutcome {
                                     stats,
                                     mode: "mft",
-                                    note: None,
+                                    note: Some(diag.to_string()),
                                 })
                             }
                             UsnScan::TooManyDirs if explicit => {
