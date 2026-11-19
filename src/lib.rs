@@ -4,6 +4,7 @@ pub mod cli;
 pub mod config;
 pub mod db;
 pub mod diff;
+pub mod elevated;
 pub mod exit;
 pub mod fmt;
 pub mod lock;

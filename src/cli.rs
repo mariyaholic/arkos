@@ -3,6 +3,7 @@
 use crate::config::Config;
 use crate::db::{self, map_db_err};
 use crate::diff::diff_snapshots;
+use crate::elevated;
 use crate::exit::{Error, Exit, Result};
 use crate::fmt::{format_delta, format_size};
 use crate::logging::Logger;
@@ -177,6 +178,9 @@ fn try_run() -> Result<Exit> {
 
     let env = PathEnvironment::capture();
     let paths = Paths::resolve(&env)?;
+    // Keep the pins until the run ends; an elevated run refuses a redirected data directory.
+    let pinned = elevated::enter(&paths, &elevated::data_chain(&paths, &env))?;
+    let harden = pinned.is_active();
     let config = Config::load(&paths.config)?;
 
     if let Command::Paths { json } = cli.command {
@@ -219,7 +223,8 @@ fn try_run() -> Result<Exit> {
                     "note: the MFT reader is experimental and untested; compare it with --mode walk (scripts/compare-mft.ps1)"
                 );
             }
-            let mut conn = db::open_and_migrate(&paths.db, &paths.locks, config.busy_timeout_ms)?;
+            let mut conn =
+                db::open_and_migrate_with(&paths.db, &paths.locks, config.busy_timeout_ms, harden)?;
             let mut progress = Reporter::auto(json);
             let report = run_scan_with_progress(
                 &mut conn,
@@ -373,7 +378,8 @@ fn try_run() -> Result<Exit> {
                 return Err(Error::Cli("--keep must be between 1 and 12".into()));
             }
             let volume = volume.as_deref().map(volume_key).transpose()?;
-            let conn = db::open_and_migrate(&paths.db, &paths.locks, config.busy_timeout_ms)?;
+            let conn =
+                db::open_and_migrate_with(&paths.db, &paths.locks, config.busy_timeout_ms, harden)?;
             if yes {
                 let deleted = db::retention::prune_completed(&conn, volume.as_deref(), keep)?;
                 if json {
@@ -480,13 +486,23 @@ fn try_run() -> Result<Exit> {
                 Ok(Exit::Ok)
             }
             DbAction::Migrate => {
-                let conn = db::open_and_migrate(&paths.db, &paths.locks, config.busy_timeout_ms)?;
+                let conn = db::open_and_migrate_with(
+                    &paths.db,
+                    &paths.locks,
+                    config.busy_timeout_ms,
+                    harden,
+                )?;
                 let ver: u32 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
                 println!("migrated shimatsu.sqlite user_version={ver}");
                 Ok(Exit::Ok)
             }
             DbAction::Vacuum => {
-                let conn = db::open_and_migrate(&paths.db, &paths.locks, config.busy_timeout_ms)?;
+                let conn = db::open_and_migrate_with(
+                    &paths.db,
+                    &paths.locks,
+                    config.busy_timeout_ms,
+                    harden,
+                )?;
                 let reclaimed = db::vacuum(&conn)?;
                 println!("vacuum reclaimed {reclaimed} bytes");
                 Ok(Exit::Ok)

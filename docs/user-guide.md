@@ -118,3 +118,27 @@ and one added entry, for folders and files alike.
 Sizes are logical and counted per name. A hardlinked file can be counted more than once by the
 walk, and allocated size on disk can be smaller for compressed, sparse or cloud placeholder files.
 Every report says so. The ledger layout for other tools is in `schema-contract.md`.
+
+## Running elevated
+
+Run Arkos from an ordinary prompt unless you need `--mode mft`, which is the one feature that asks
+for an elevated token. Your data folder (`ARKOS_HOME`, or `%LOCALAPPDATA%\mariyaholic\shimatsu`)
+belongs to your account, and other programs that run as you can change it. An elevated Arkos
+therefore guards it, for every verb:
+
+- It holds the folders from the data root down to `locks` and `logs` open for the whole run, so
+  none of them can be renamed, deleted or replaced while Arkos runs.
+- It exits 4 and names the folder when one of them is a junction or symbolic link, or resolves to a
+  different place than expected. It never falls back to another folder, so there is still one
+  ledger.
+- It exits 4 and names the file when `shimatsu.sqlite`, its `-wal` and `-shm` files, `arkos.log`
+  and its rotated copies, or a lock or heartbeat file is a link or has more than one hard link.
+- It opens the ledger with SQLite's defensive mode on, triggers and views that call functions off,
+  and a `quick_check` before the first write. A failed check exits 4. Run `arkos db vacuum` from a
+  prompt that is not elevated to repair the ledger.
+
+If an elevated run refuses, remove the link it names, or scan from a prompt that is not elevated.
+
+On Linux and macOS Arkos has no elevated mode and none of this runs. Do not run it under `sudo`:
+with `HOME` kept, root would write into your data folder, and nothing guards that folder there.
+Use `ARKOS_HOME` for a separate folder if you need one.
