@@ -143,11 +143,11 @@ mod win {
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateDirectoryW, CreateFileW, FileAttributeTagInfo, GetFileInformationByHandle,
-        GetFileInformationByHandleEx, GetFinalPathNameByHandleW, BY_HANDLE_FILE_INFORMATION,
-        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_NAME_NORMALIZED,
-        FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
-        VOLUME_NAME_DOS,
+        GetFileInformationByHandleEx, GetFinalPathNameByHandleW, GetLongPathNameW,
+        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+        FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, OPEN_EXISTING, VOLUME_NAME_DOS,
     };
 
     fn wide(path: &Path) -> Vec<u16> {
@@ -212,13 +212,36 @@ mod win {
             )));
         }
         let resolved = final_path(&handle)?;
-        if !final_path_matches(&dir.to_string_lossy(), &resolved) {
+        // A short (8.3) name in the configured path is not a redirect, so compare the long form
+        // too. A `subst` or mapped drive still differs and is refused.
+        let expected = dir.to_string_lossy();
+        let matches = final_path_matches(&expected, &resolved)
+            || long_path(dir).is_some_and(|long| final_path_matches(&long, &resolved));
+        if !matches {
             return Err(Error::Refused(format!(
                 "{} resolves to {resolved}; elevated runs refuse to write through a redirected folder",
                 dir.display()
             )));
         }
         Ok(handle)
+    }
+
+    /// The long form of `dir` (8.3 parts expanded), or `None` when the call fails.
+    fn long_path(dir: &Path) -> Option<String> {
+        let name = wide(dir);
+        let mut buf = vec![0u16; 1024];
+        loop {
+            // SAFETY: `name` is NUL-terminated and `buf` holds `buf.len()` elements.
+            let n = unsafe { GetLongPathNameW(name.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) }
+                as usize;
+            if n == 0 {
+                return None;
+            }
+            if n < buf.len() {
+                return Some(String::from_utf16_lossy(&buf[..n]));
+            }
+            buf.resize(n + 1, 0);
+        }
     }
 
     fn tag_attributes(handle: &OwnedHandle) -> Result<u32> {

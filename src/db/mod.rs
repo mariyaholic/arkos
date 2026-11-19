@@ -100,10 +100,7 @@ pub fn open_with(
 
 /// Shut off the schema features a planted ledger would use, then check the file once.
 fn harden_connection(conn: &Connection) -> Result<()> {
-    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)
-        .map_err(map_db_err)?;
-    conn.pragma_update(None, "trusted_schema", false)
-        .map_err(map_db_err)?;
+    defend_connection(conn)?;
     let verdict: String = conn
         .query_row("PRAGMA quick_check", [], |r| r.get(0))
         .map_err(|e| match map_db_err(e) {
@@ -114,6 +111,15 @@ fn harden_connection(conn: &Connection) -> Result<()> {
         return Err(failed_quick_check(verdict));
     }
     Ok(())
+}
+
+/// Defensive mode and `trusted_schema = OFF`, with no integrity check. Used on every elevated
+/// open, including the read-only verbs, which skip the `quick_check` to stay fast.
+fn defend_connection(conn: &Connection) -> Result<()> {
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)
+        .map_err(map_db_err)?;
+    conn.pragma_update(None, "trusted_schema", false)
+        .map_err(map_db_err)
 }
 
 fn failed_quick_check(detail: String) -> Error {
@@ -176,6 +182,11 @@ pub fn open_read(path: &Path, busy_timeout_ms: u64) -> Result<Option<Connection>
         return Ok(None);
     }
     let conn = open(path, busy_timeout_ms, false)?;
+    // An elevated read verb (for example `tree` writing a report) still parses a ledger that
+    // unelevated code could have written, so it gets the same defensive settings.
+    if crate::volumes::is_elevated() {
+        defend_connection(&conn)?;
+    }
     let ver: u32 = conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .map_err(map_db_err)?;
