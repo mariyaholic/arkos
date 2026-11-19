@@ -1,6 +1,7 @@
 # Elevated runs and the data directory
 
-Status: design, not implemented. Finding 2 of the 2026-11-18 security review.
+Status: design approved (owner: Maria, 2026-11-19), refuse on a reparse point. Finding 2 of the
+2026-11-18 security review.
 
 ## Problem
 
@@ -99,8 +100,8 @@ problem. The guard is Windows-only in this batch; the user guide says not to run
 - Under Wine: the pinning and refusal code paths with the elevation check forced on through a
   test-only seam.
 
-## Open question for the owner
+## Decision (owner: Maria, 2026-11-19)
 
-Should an elevated run that finds a reparse point refuse (proposed), or move to a fresh data
-directory under `%ProgramData%` that it creates with an admin-only ACL (option B for that run only)?
-Refusing is simpler and keeps one ledger; the user fixes the folder and runs again.
+An elevated run that finds a reparse point, a hard-linked file or a path mismatch refuses with exit
+4 and names the folder or file. It does not fall back to another data directory, so there is still
+one ledger.
