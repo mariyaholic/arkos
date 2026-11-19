@@ -21,7 +21,27 @@ pub fn temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("arkos-test-{}-{name}-{n}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create temp dir");
-    dir
+    long_form(dir)
+}
+
+/// The same folder with 8.3 short names expanded. The Windows runner's temp folder sits under
+/// `RUNNER~1`, while a scan stores the long form (`runneradmin`), so tests that compare stored
+/// paths with their own would differ. `canonicalize` expands the names; its `\\?\` prefix is
+/// dropped again so paths keep the ordinary drive form.
+fn long_form(dir: PathBuf) -> PathBuf {
+    if !cfg!(windows) {
+        return dir;
+    }
+    match std::fs::canonicalize(&dir) {
+        Ok(full) => {
+            let text = full.to_string_lossy();
+            match text.strip_prefix(r"\\?\") {
+                Some(rest) if !rest.starts_with("UNC") => PathBuf::from(rest),
+                _ => dir,
+            }
+        }
+        Err(_) => dir,
+    }
 }
 
 /// A scratch Arkos home with an open, migrated ledger.
