@@ -199,10 +199,10 @@ impl Heartbeat {
 fn busy_message(path: &Path, volume: &str, timeout_ms: u64) -> String {
     let mut msg = format!("volume lock for {volume} is held past {timeout_ms}ms");
     if let Some(hb) = read_heartbeat(path) {
-        msg.push_str(&format!(" by pid {}", hb.pid));
+        msg.push_str(&format!(" by a scan reporting pid {}", hb.pid));
         if let Some(age) = hb.stalled_for(chrono::Utc::now().timestamp()) {
             msg.push_str(&format!(
-                "; that scan has not progressed for {age}s and looks stalled; end process {} if it is hung",
+                "; that scan has not progressed for {age}s and looks stalled; check that pid {} is arkos before ending it if it is hung",
                 hb.pid
             ));
         }

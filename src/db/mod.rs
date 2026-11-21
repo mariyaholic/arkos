@@ -3,6 +3,7 @@
 pub mod retention;
 
 use crate::exit::{Error, Result};
+use rusqlite::config::DbConfig;
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -16,6 +17,18 @@ const MIGRATION_0001: &str = include_str!("0001.sql");
 
 /// Open `shimatsu.sqlite` with explicit read-only vs read-write policy.
 pub fn open(path: &Path, busy_timeout_ms: u64, writable: bool) -> Result<Connection> {
+    open_with(path, busy_timeout_ms, writable, false)
+}
+
+/// Like [`open`]. With `harden` (elevated runs) the connection is made defensive before anything
+/// is written: `SQLITE_DBCONFIG_DEFENSIVE`, `trusted_schema = OFF`, and a `quick_check` whose
+/// failure refuses with exit 4.
+pub fn open_with(
+    path: &Path,
+    busy_timeout_ms: u64,
+    writable: bool,
+    harden: bool,
+) -> Result<Connection> {
     if writable {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|source| Error::Io {
@@ -34,6 +47,9 @@ pub fn open(path: &Path, busy_timeout_ms: u64, writable: bool) -> Result<Connect
         .map_err(map_db_err)?;
     conn.pragma_update(None, "foreign_keys", true)
         .map_err(map_db_err)?;
+    if harden {
+        harden_connection(&conn)?;
+    }
 
     let user_version: u32 = conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
@@ -82,6 +98,36 @@ pub fn open(path: &Path, busy_timeout_ms: u64, writable: bool) -> Result<Connect
     Ok(conn)
 }
 
+/// Shut off the schema features a planted ledger would use, then check the file once.
+fn harden_connection(conn: &Connection) -> Result<()> {
+    defend_connection(conn)?;
+    let verdict: String = conn
+        .query_row("PRAGMA quick_check", [], |r| r.get(0))
+        .map_err(|e| match map_db_err(e) {
+            Error::Busy(m) => Error::Busy(m),
+            _ => failed_quick_check("the check could not run".into()),
+        })?;
+    if verdict != "ok" {
+        return Err(failed_quick_check(verdict));
+    }
+    Ok(())
+}
+
+/// Defensive mode and `trusted_schema = OFF`, with no integrity check. Used on every elevated
+/// open, including the read-only verbs, which skip the `quick_check` to stay fast.
+fn defend_connection(conn: &Connection) -> Result<()> {
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)
+        .map_err(map_db_err)?;
+    conn.pragma_update(None, "trusted_schema", false)
+        .map_err(map_db_err)
+}
+
+fn failed_quick_check(detail: String) -> Error {
+    Error::Refused(format!(
+        "ledger.check: quick_check failed in an elevated run ({detail}); run `arkos db vacuum` from a prompt that is not elevated"
+    ))
+}
+
 /// Page cache during a scan, in KiB (32 MiB). Keeps the index pages of a large insert resident.
 const SCAN_CACHE_KIB: i64 = 32 * 1024;
 /// Page cache outside a scan, in KiB (4 MiB).
@@ -112,7 +158,17 @@ pub fn end_bulk_write(conn: &Connection) {
 /// `locks_dir` is where volume locks live (`Paths::locks`); the sweep checks it to tell a live
 /// scan from a dead one. Used by the verbs that write: `scan`, `prune`, `db migrate`, `db vacuum`.
 pub fn open_and_migrate(path: &Path, locks_dir: &Path, busy_timeout_ms: u64) -> Result<Connection> {
-    let conn = open(path, busy_timeout_ms, true)?;
+    open_and_migrate_with(path, locks_dir, busy_timeout_ms, false)
+}
+
+/// [`open_and_migrate`] with `harden` set for elevated runs (see [`open_with`]).
+pub fn open_and_migrate_with(
+    path: &Path,
+    locks_dir: &Path,
+    busy_timeout_ms: u64,
+    harden: bool,
+) -> Result<Connection> {
+    let conn = open_with(path, busy_timeout_ms, true, harden)?;
     migrate(&conn)?;
     retention::sweep_abandoned_with_locks(&conn, locks_dir, chrono::Utc::now().timestamp())?;
     Ok(conn)
@@ -126,6 +182,11 @@ pub fn open_read(path: &Path, busy_timeout_ms: u64) -> Result<Option<Connection>
         return Ok(None);
     }
     let conn = open(path, busy_timeout_ms, false)?;
+    // An elevated read verb (for example `tree` writing a report) still parses a ledger that
+    // unelevated code could have written, so it gets the same defensive settings.
+    if crate::volumes::is_elevated() {
+        defend_connection(&conn)?;
+    }
     let ver: u32 = conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .map_err(map_db_err)?;

@@ -54,10 +54,21 @@ fn diff_names_the_expected_top_five_directories() {
     let b = env.scan(&tree);
 
     let report = diff_snapshots(&env.conn, a.snapshot_id, b.snapshot_id, 0, 1000).unwrap();
+    // Strip the root the scan stored, not `tree`: on Windows the temp folder can carry an 8.3
+    // short name (RUNNER~1) that the scan expands to the long form.
+    let root: String = env
+        .conn
+        .query_row(
+            "SELECT root FROM arkos_snapshots WHERE id = ?1",
+            [b.snapshot_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let root = Path::new(&root);
     let dirs: Vec<(String, i64)> = report
         .dirs
         .iter()
-        .map(|d| (rel(&d.path, &tree), d.delta_bytes))
+        .map(|d| (rel(&d.path, root), d.delta_bytes))
         .collect();
     let mib = |n: i64| n * MIB as i64;
     let top5: Vec<(String, i64)> = dirs.iter().take(5).cloned().collect();
@@ -76,7 +87,7 @@ fn diff_names_the_expected_top_five_directories() {
     let fresh = report
         .dirs
         .iter()
-        .find(|d| rel(&d.path, &tree) == "fresh")
+        .find(|d| rel(&d.path, root) == "fresh")
         .unwrap();
     assert_eq!(fresh.kind, ChangeKind::Added);
 }

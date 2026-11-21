@@ -11,11 +11,12 @@ jobs:
   windows:
     runs-on: windows-latest
     env:
-      SIGNING_CERT_BASE64: ${{ secrets.SIGNING_CERT_BASE64 }}
+      HAS_SIGNING_CERT: ${{ secrets.SIGNING_CERT_BASE64 != '' }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
+          toolchain: stable
           targets: x86_64-pc-windows-msvc
       - run: cargo build --release --target x86_64-pc-windows-msvc
       - name: Collect the binary
@@ -25,9 +26,10 @@ jobs:
       # Signing runs only when the repository has a certificate configured. The secret is read
       # from the repository settings and is never written to this file.
       - name: Sign
-        if: ${{ env.SIGNING_CERT_BASE64 != '' }}
+        if: ${{ env.HAS_SIGNING_CERT == 'true' }}
         shell: pwsh
         env:
+          SIGNING_CERT_BASE64: ${{ secrets.SIGNING_CERT_BASE64 }}
           SIGNING_CERT_PASSWORD: ${{ secrets.SIGNING_CERT_PASSWORD }}
         run: |
           [IO.File]::WriteAllBytes("cert.pfx", [Convert]::FromBase64String($env:SIGNING_CERT_BASE64))
@@ -39,7 +41,7 @@ jobs:
           $h = (Get-FileHash arkos.exe -Algorithm SHA256).Hash.ToLower()
           "$h  arkos.exe" | Out-File -Encoding ascii arkos.exe.sha256
       # A tag with a hyphen (for example v0.2.0-exp.1) is a prerelease and is not marked latest.
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           prerelease: ${{ contains(github.ref_name, '-') }}
           make_latest: ${{ !contains(github.ref_name, '-') }}

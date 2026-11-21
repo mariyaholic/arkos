@@ -23,9 +23,12 @@ if ($Root -notmatch '^[A-Za-z]:\\?$') {
 $volume = $Root.Substring(0, 2).ToUpper()
 
 if ($Arkos -eq '') {
-    $built = Join-Path (Split-Path -Parent $PSScriptRoot) 'target\release\arkos.exe'
-    if (Test-Path $built) { $Arkos = $built } else { $Arkos = 'arkos' }
+    $Arkos = Join-Path (Split-Path -Parent $PSScriptRoot) 'target\release\arkos.exe'
 }
+if (-not (Test-Path -LiteralPath $Arkos -PathType Leaf)) {
+    throw "arkos.exe not found at '$Arkos'; build it with 'cargo build --release' or pass -Arkos path\to\arkos.exe"
+}
+$Arkos = (Resolve-Path -LiteralPath $Arkos).ProviderPath
 
 $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
